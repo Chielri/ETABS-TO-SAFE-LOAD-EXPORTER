@@ -45,10 +45,12 @@ def connect_to_safe():
 
 def get_selected_area_names(etabs_model):
     """Get names of selected area/shell objects in ETABS."""
-    number_items = 0
-    object_type = []
-    object_name = []
-    ret = etabs_model.SelectObj.GetSelected(number_items, object_type, object_name)
+    ret = etabs_model.SelectObj.GetSelected(0, [], [])
+    # ret: (NumberItems, ObjectType, ObjectName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        print(f"ERROR: Failed to get selection from ETABS (ret={retcode}).")
+        sys.exit(1)
     number_items = ret[0]
     object_type = ret[1]
     object_name = ret[2]
@@ -71,6 +73,11 @@ def get_selected_area_names(etabs_model):
 def get_etabs_label(etabs_model, area_name):
     """Get the label and story for an area object in ETABS."""
     ret = etabs_model.AreaObj.GetLabelFromName(area_name, "", "")
+    # ret: (Label, Story, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        print(f"  WARNING: GetLabelFromName failed for '{area_name}' (ret={retcode}).")
+        return area_name, ""
     label = ret[0]
     story = ret[1]
     return label, story
@@ -82,8 +89,11 @@ def get_shell_uniform_loads(etabs_model, area_name):
     Returns a list of dicts with load details.
     """
     ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+    # ret layout: (NumberItems, AreaName, LoadPat, CSys, Dir, Value, retcode)
+    retcode = ret[-1]
     number_items = ret[0]
-    area_names = ret[1]
+    if retcode != 0 or number_items == 0:
+        return []
     load_pats = ret[2]
     csys = ret[3]
     dirs = ret[4]
@@ -103,7 +113,11 @@ def get_shell_uniform_loads(etabs_model, area_name):
 def get_safe_area_names(safe_model):
     """Get all area object names in SAFE and return as a set for fast lookup."""
     ret = safe_model.AreaObj.GetNameList(0, [])
-    number_names = ret[0]
+    # ret: (NumberNames, MyName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        print(f"WARNING: Failed to get area names from SAFE (ret={retcode}).")
+        return set()
     names = ret[1]
     name_set = set(names) if names else set()
     print(f"Found {len(name_set)} area object(s) in SAFE.")
@@ -115,18 +129,23 @@ def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
     if pattern_name not in existing_patterns:
         # Type 8 = Other (generic). SelfWtMultiplier = 0. AddLoadCase = True.
         ret = safe_model.LoadPatterns.Add(pattern_name, 8, 0, True)
-        if ret == 0:
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode == 0:
             existing_patterns.add(pattern_name)
             print(f"  Created load pattern '{pattern_name}' in SAFE.")
         else:
-            print(f"  WARNING: Failed to create load pattern '{pattern_name}' (ret={ret}).")
+            print(f"  WARNING: Failed to create load pattern '{pattern_name}' (ret={retcode}).")
     return existing_patterns
 
 
 def get_existing_load_patterns(safe_model):
     """Get all existing load pattern names in SAFE."""
     ret = safe_model.LoadPatterns.GetNameList(0, [])
-    number_names = ret[0]
+    # ret: (NumberNames, MyName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        print(f"WARNING: Failed to get load patterns from SAFE (ret={retcode}).")
+        return set()
     names = ret[1]
     return set(names) if names else set()
 
@@ -136,6 +155,7 @@ def assign_load_to_safe(safe_model, slab_name, load):
 
     SetLoadUniform(Name, LoadPat, Value, Dir, Replace, CSys)
     Replace=True replaces existing load of same pattern, False adds to it.
+    Returns 0 on success, non-zero on failure.
     """
     ret = safe_model.AreaObj.SetLoadUniform(
         slab_name,
@@ -145,6 +165,9 @@ def assign_load_to_safe(safe_model, slab_name, load):
         True,  # Replace existing load for this pattern
         load["csys"],
     )
+    # COM may return a tuple; the status code is the last element
+    if isinstance(ret, (tuple, list)):
+        return ret[-1]
     return ret
 
 

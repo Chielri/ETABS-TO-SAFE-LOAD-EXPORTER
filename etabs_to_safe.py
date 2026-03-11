@@ -36,7 +36,8 @@ def connect_to_safe():
     try:
         helper = comtypes.client.CreateObject("SAFEv1.Helper")
         helper = helper.QueryInterface(comtypes.gen.SAFEv1.cHelper)
-        safe_object = helper.GetObject("CSI.SAFE.API.SAFEObject")
+        # NOTE: SAFE reuses ETABS API infrastructure — the ProgID is "ETABSObject", not "SAFEObject"
+        safe_object = helper.GetObject("CSI.SAFE.API.ETABSObject")
         if safe_object is None:
             raise RuntimeError("SAFE returned no application object.")
         sap_model = safe_object.SapModel

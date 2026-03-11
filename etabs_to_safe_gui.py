@@ -156,7 +156,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
     # Discover candidate table names
     candidate_tables = []
     try:
-        ret = db.GetAvailableTables(0, [])
+        ret = db.GetAvailableTables(0, [], [], [])
         if ret[-1] == 0 and ret[1]:
             for t in ret[1]:
                 tl = t.lower()
@@ -189,13 +189,15 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
 def _query_table_for_loads(db, table_name, area_name):
     """Query a single database table for uniform loads matching area_name."""
     try:
-        ret = db.GetTableForDisplayArray(table_name, "", "", 0, [], 0, [])
+        # Signature: (TableKey, FieldKeyList[], GroupName, TableVersion, FieldsKeysIncluded[], NumberRecords, TableData[])
+        # Returns:   (FieldKeyList, TableVersion, FieldsKeysIncluded, NumberRecords, TableData, retcode)
+        ret = db.GetTableForDisplayArray(table_name, [], "", 0, [], 0, [])
         if ret[-1] != 0:
             return []
 
-        fields = list(ret[1]) if ret[1] else []
-        num_records = ret[2]
-        table_data = list(ret[3]) if ret[3] else []
+        fields = list(ret[2]) if ret[2] else []
+        num_records = ret[3]
+        table_data = list(ret[4]) if ret[4] else []
 
         if not fields or num_records == 0:
             return []
@@ -241,16 +243,41 @@ def _query_table_for_loads(db, table_name, area_name):
 
 
 def get_safe_area_names(safe_model):
-    ret = safe_model.AreaObj.GetNameList(0, [])
-    # ret: (NumberNames, MyName, retcode)
-    retcode = ret[-1]
-    if retcode != 0:
-        logger.warning("Failed to get area names from SAFE (ret=%s).", retcode)
-        return set()
-    names = ret[1]
-    name_set = set(names) if names else set()
-    logger.info("Found %d area object(s) in SAFE.", len(name_set))
-    return name_set
+    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
+    try:
+        ret = safe_model.AreaObj.GetNameList(0, [])
+        retcode = ret[-1]
+        if retcode == 0 and ret[1]:
+            name_set = set(ret[1])
+            logger.info("Found %d area object(s) in SAFE.", len(name_set))
+            return name_set
+    except Exception as e:
+        logger.debug("AreaObj.GetNameList not available: %s", e)
+
+    # Fallback: database tables (required for SAFE v22+)
+    logger.debug("Trying database tables to get SAFE area names...")
+    try:
+        db = safe_model.DatabaseTables
+        ret = db.GetTableForDisplayArray("Objects and Elements - Areas", [], "", 0, [], 0, [])
+        if ret[-1] == 0 and ret[4]:
+            fields = list(ret[2]) if ret[2] else []
+            num_records = ret[3]
+            table_data = list(ret[4])
+            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+            if name_col is not None:
+                num_fields = len(fields)
+                name_set = set()
+                for row in range(num_records):
+                    start = row * num_fields
+                    if start + name_col < len(table_data):
+                        name_set.add(table_data[start + name_col])
+                logger.info("Found %d area object(s) in SAFE (via tables).", len(name_set))
+                return name_set
+    except Exception as e:
+        logger.debug("SAFE database table fallback failed: %s", e)
+
+    logger.warning("Failed to get area names from SAFE.")
+    return set()
 
 
 def get_existing_load_patterns(safe_model):
@@ -277,13 +304,82 @@ def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
-    ret = safe_model.AreaObj.SetLoadUniform(
-        slab_name, load["load_pattern"], load["value"],
-        load["direction"], True, load["csys"],
-    )
-    if isinstance(ret, (tuple, list)):
-        return ret[-1]
-    return ret
+    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
+    try:
+        ret = safe_model.AreaObj.SetLoadUniform(
+            slab_name, load["load_pattern"], load["value"],
+            load["direction"], True, load["csys"],
+        )
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode == 0:
+            return 0
+        logger.debug("  AreaObj.SetLoadUniform returned %s, trying database tables...", retcode)
+    except Exception as e:
+        logger.debug("  AreaObj.SetLoadUniform not available: %s", e)
+
+    # Fallback: database tables (required for SAFE v22+)
+    return _assign_load_via_tables(safe_model, slab_name, load)
+
+
+def _assign_load_via_tables(safe_model, slab_name, load):
+    """Assign a uniform load to SAFE via database tables API."""
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+
+        # Get current table structure
+        ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
+        if ret[-1] != 0:
+            logger.debug("  GetTableForEditingArray failed (ret=%s)", ret[-1])
+            return ret[-1]
+
+        table_version = ret[0]
+        fields = list(ret[1]) if ret[1] else []
+        num_records = ret[2]
+        table_data = list(ret[3]) if ret[3] else []
+
+        if not fields:
+            logger.debug("  No fields in '%s' table", table_key)
+            return -1
+
+        num_fields = len(fields)
+
+        # Build a new row with empty values
+        new_row = [""] * num_fields
+        for idx, f in enumerate(fields):
+            fl = f.lower().strip()
+            if fl in ("uniquename", "unique name", "name"):
+                new_row[idx] = slab_name
+            elif fl in ("loadpat", "load pattern", "loadpattern"):
+                new_row[idx] = load["load_pattern"]
+            elif fl in ("dir", "direction"):
+                new_row[idx] = str(load["direction"])
+            elif fl in ("unifload", "uniform load", "value"):
+                new_row[idx] = str(load["value"])
+            elif fl in ("csys", "coordsys", "coord sys"):
+                new_row[idx] = load["csys"]
+
+        # Append the new row
+        num_records += 1
+        table_data.extend(new_row)
+
+        ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
+        if isinstance(ret, (tuple, list)):
+            retcode = ret[-1]
+        else:
+            retcode = ret
+        if retcode != 0:
+            logger.debug("  SetTableForEditingArray failed (ret=%s)", retcode)
+            return retcode
+
+        ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode != 0:
+            logger.debug("  ApplyEditedTables failed (ret=%s)", retcode)
+        return retcode
+    except Exception as e:
+        logger.debug("  Database table load assignment failed: %s", e)
+        return -1
 
 
 def run_export(progress_callback=None):

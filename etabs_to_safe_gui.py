@@ -183,76 +183,66 @@ def _find_column(fields, *candidates):
     return None
 
 
+def _read_table(db, table_name):
+    """Read a database table and return (fields, num_fields, num_records, table_data) or None."""
+    try:
+        ret = db.GetTableForDisplayArray(table_name, [], "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return None
+        fields = list(ret[2]) if ret[2] else []
+        num_records = ret[3]
+        table_data = list(ret[4]) if ret[4] else []
+        if not fields or num_records == 0:
+            return None
+        logger.debug("  Table '%s': fields=%s, records=%d", table_name, fields, num_records)
+        return fields, len(fields), num_records, table_data
+    except Exception as e:
+        logger.debug("  Table '%s' read error: %s", table_name, e)
+        return None
+
+
 def _get_uniform_loads_from_tables(etabs_model, area_name):
-    """Retrieve shell uniform loads via ETABS database tables API."""
+    """Retrieve shell uniform loads via ETABS database tables API.
+
+    Strategy:
+    1) Try direct uniform load tables (have LoadPattern + Load columns).
+    2) Try Load Set resolution: join the assignment table (slab -> LoadSet name)
+       with the definition table (LoadSet name -> LoadPattern + LoadValue).
+    """
     db = etabs_model.DatabaseTables
 
     # Discover candidate table names
-    candidate_tables = []
+    all_tables = []
     try:
         ret = db.GetAvailableTables(0, [], [], [])
         if ret[-1] == 0 and ret[1]:
             for t in ret[1]:
                 tl = t.lower()
                 if "uniform" in tl and ("area" in tl or "shell" in tl):
-                    candidate_tables.append(t)
+                    all_tables.append(t)
                 elif "load set" in tl and ("area" in tl or "shell" in tl):
-                    candidate_tables.append(t)
-            logger.debug("  Discovered load tables: %s", candidate_tables)
+                    all_tables.append(t)
+            logger.debug("  Discovered load tables: %s", all_tables)
     except Exception as e:
         logger.debug("  GetAvailableTables error: %s", e)
 
-    # Also try well-known table names (including Load Set tables)
-    known = [
-        "Area Load Assignments - Uniform Shell",
-        "Area Loads - Uniform Shell",
-        "Shell Uniform Load Assignments",
-        "Area Load Assignments - Uniform - Shell",
-        "Area Load Set Assignments - Shell",
-        "Shell Load Set Assignments",
-        "Area Load Assignments - Load Sets",
-    ]
-    tables_to_try = candidate_tables + [n for n in known if n not in candidate_tables]
+    # --- Step 1: Try direct uniform load tables ---
+    for table_name in all_tables:
+        tdata = _read_table(db, table_name)
+        if tdata is None:
+            continue
+        fields, num_fields, num_records, table_data = tdata
 
-    for table_name in tables_to_try:
-        loads = _query_table_for_loads(db, table_name, area_name)
-        if loads:
-            logger.info("  Found %d load(s) via table '%s'", len(loads), table_name)
-            return loads
-
-    return []
-
-
-def _query_table_for_loads(db, table_name, area_name):
-    """Query a single database table for uniform loads matching area_name."""
-    try:
-        # Signature: (TableKey, FieldKeyList[], GroupName, TableVersion, FieldsKeysIncluded[], NumberRecords, TableData[])
-        # Returns:   (FieldKeyList, TableVersion, FieldsKeysIncluded, NumberRecords, TableData, retcode)
-        ret = db.GetTableForDisplayArray(table_name, [], "", 0, [], 0, [])
-        if ret[-1] != 0:
-            return []
-
-        fields = list(ret[2]) if ret[2] else []
-        num_records = ret[3]
-        table_data = list(ret[4]) if ret[4] else []
-
-        if not fields or num_records == 0:
-            return []
-
-        logger.debug("  Table '%s': fields=%s, records=%d", table_name, fields, num_records)
-
-        num_fields = len(fields)
-
-        # Identify columns
-        name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName", "Name")
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
         pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
-        dir_col = _find_column(fields, "Dir", "Direction")
         val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value", "Load")
-        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
-        if name_col is None:
-            logger.debug("  No name column found in '%s'", table_name)
-            return []
+        # Need name + pattern + value to be a direct-load table
+        if name_col is None or pat_col is None or val_col is None:
+            continue
+
+        dir_col = _find_column(fields, "Dir", "Direction")
+        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
         loads = []
         for row in range(num_records):
@@ -260,23 +250,103 @@ def _query_table_for_loads(db, table_name, area_name):
             row_data = table_data[start:start + num_fields]
             if len(row_data) < num_fields:
                 continue
-
             if row_data[name_col] != area_name:
                 continue
-
             load = {
-                "load_pattern": row_data[pat_col] if pat_col is not None else "Unknown",
+                "load_pattern": row_data[pat_col],
                 "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-                "value": float(row_data[val_col]) if val_col is not None else 0.0,
+                "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             }
             loads.append(load)
-            logger.debug("  Table row match: %s", load)
+            logger.debug("  Direct table row match: %s", load)
 
-        return loads
-    except Exception as e:
-        logger.debug("  Table '%s' query error: %s", table_name, e)
+        loads = _filter_internal_patterns(loads)
+        if loads:
+            logger.info("  Found %d load(s) via direct table '%s'", len(loads), table_name)
+            return loads
+
+    # --- Step 2: Load Set resolution (two-table join) ---
+    # Find the assignment table: maps UniqueName -> LoadSet name
+    # Find the definition table: maps LoadSet Name -> LoadPattern + LoadValue
+    assign_table = None
+    defn_table = None
+    for t in all_tables:
+        tl = t.lower()
+        if "load set" in tl and ("assignment" in tl or "area load" in tl):
+            assign_table = t
+        elif "load set" in tl and "shell" in tl and "assignment" not in tl and "area load" not in tl:
+            defn_table = t
+
+    logger.debug("  Load Set tables: assign='%s', defn='%s'", assign_table, defn_table)
+
+    if not assign_table or not defn_table:
         return []
+
+    # Read the assignment table to find which LoadSet(s) this slab uses
+    tdata = _read_table(db, assign_table)
+    if tdata is None:
+        return []
+    fields, num_fields, num_records, table_data = tdata
+
+    name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
+    set_col = _find_column(fields, "LoadSet", "Load Set")
+    if name_col is None or set_col is None:
+        logger.debug("  Assignment table missing UniqueName or LoadSet column")
+        return []
+
+    load_set_names = set()
+    for row in range(num_records):
+        start = row * num_fields
+        row_data = table_data[start:start + num_fields]
+        if len(row_data) < num_fields:
+            continue
+        if row_data[name_col] == area_name:
+            load_set_names.add(row_data[set_col])
+
+    if not load_set_names:
+        logger.debug("  No Load Set assignments found for '%s'", area_name)
+        return []
+
+    logger.debug("  Slab '%s' uses Load Set(s): %s", area_name, load_set_names)
+
+    # Read the definition table to resolve LoadSet -> LoadPattern + LoadValue
+    tdata = _read_table(db, defn_table)
+    if tdata is None:
+        return []
+    fields, num_fields, num_records, table_data = tdata
+
+    set_name_col = _find_column(fields, "Name", "LoadSet", "Load Set")
+    pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
+    val_col = _find_column(fields, "LoadValue", "Load Value", "UnifLoad", "Uniform Load", "Value", "Load")
+    dir_col = _find_column(fields, "Dir", "Direction")
+    csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+
+    if set_name_col is None or pat_col is None or val_col is None:
+        logger.debug("  Definition table missing required columns (Name/LoadPattern/LoadValue)")
+        return []
+
+    loads = []
+    for row in range(num_records):
+        start = row * num_fields
+        row_data = table_data[start:start + num_fields]
+        if len(row_data) < num_fields:
+            continue
+        if row_data[set_name_col] not in load_set_names:
+            continue
+        load = {
+            "load_pattern": row_data[pat_col],
+            "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
+            "value": float(row_data[val_col]),
+            "csys": row_data[csys_col] if csys_col is not None else "Global",
+        }
+        loads.append(load)
+        logger.debug("  Load Set resolved: Set='%s', %s", row_data[set_name_col], load)
+
+    loads = _filter_internal_patterns(loads)
+    if loads:
+        logger.info("  Found %d load(s) via Load Set tables", len(loads))
+    return loads
 
 
 def get_safe_area_names(safe_model):

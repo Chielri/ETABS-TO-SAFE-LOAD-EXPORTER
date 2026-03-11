@@ -37,9 +37,9 @@ def connect_to_etabs():
 
 def connect_to_safe():
     import comtypes.client
-    safe_object = comtypes.client.CreateObject("SAFEv1.Helper")
-    safe_object = safe_object.QueryInterface(comtypes.gen.SAFEv1.cHelper)
-    safe_object = safe_object.GetObject("CSI.SAFE.API.SAFEObject")
+    helper = comtypes.client.CreateObject("SAFEv1.Helper")
+    helper = helper.QueryInterface(comtypes.gen.SAFEv1.cHelper)
+    safe_object = helper.GetObject("CSI.SAFE.API.SAFEObject")
     sap_model = safe_object.SapModel
     logger.info("Connected to SAFE: %s", sap_model.GetModelFilename())
     return safe_object, sap_model
@@ -62,7 +62,10 @@ def get_etabs_label(etabs_model, area_name):
 
 def get_shell_uniform_loads(etabs_model, area_name):
     ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+    retcode = ret[-1]
     number_items = ret[0]
+    if retcode != 0 or number_items == 0:
+        return []
     loads = []
     for i in range(number_items):
         loads.append({
@@ -91,19 +94,23 @@ def get_existing_load_patterns(safe_model):
 def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
     if pattern_name not in existing_patterns:
         ret = safe_model.LoadPatterns.Add(pattern_name, 8, 0, True)
-        if ret == 0:
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode == 0:
             existing_patterns.add(pattern_name)
             logger.info("  Created load pattern '%s' in SAFE.", pattern_name)
         else:
-            logger.warning("  Failed to create load pattern '%s' (ret=%s).", pattern_name, ret)
+            logger.warning("  Failed to create load pattern '%s' (ret=%s).", pattern_name, retcode)
     return existing_patterns
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
-    return safe_model.AreaObj.SetLoadUniform(
+    ret = safe_model.AreaObj.SetLoadUniform(
         slab_name, load["load_pattern"], load["value"],
         load["direction"], True, load["csys"],
     )
+    if isinstance(ret, (tuple, list)):
+        return ret[-1]
+    return ret
 
 
 def run_export(progress_callback=None):
@@ -280,8 +287,13 @@ class App(tk.Tk):
 
     def _run_worker(self):
         try:
-            summary = run_export(progress_callback=self._update_progress)
-            self.after(0, self._on_done, summary)
+            import comtypes
+            comtypes.CoInitialize()
+            try:
+                summary = run_export(progress_callback=self._update_progress)
+                self.after(0, self._on_done, summary)
+            finally:
+                comtypes.CoUninitialize()
         except Exception as e:
             logger.error("Export failed: %s", e)
             logger.debug(traceback.format_exc())

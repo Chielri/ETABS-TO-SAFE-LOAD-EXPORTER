@@ -88,11 +88,6 @@ def get_etabs_label(etabs_model, area_name):
     return label, story
 
 
-def _filter_internal_patterns(loads):
-    """Remove ETABS internal load patterns (e.g. ~LLRF) from results."""
-    return [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
-
-
 def get_shell_uniform_loads(etabs_model, area_name):
     """Get all shell uniform loads assigned to an area object in ETABS.
 
@@ -113,34 +108,25 @@ def get_shell_uniform_loads(etabs_model, area_name):
                     "value": ret[5][i],
                     "csys": ret[3][i],
                 })
-            loads = _filter_internal_patterns(loads)
-            if loads:
-                return loads
+            return loads
     except Exception as e:
         print(f"  DEBUG: GetLoadUniform exception: {e}")
 
     # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
-    #    NOTE: This returns one entry per mesh element, so we must deduplicate.
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
         number_items = ret[0]
         if retcode == 0 and number_items > 0:
-            seen = set()
             loads = []
             for i in range(number_items):
-                key = (ret[2][i], ret[4][i], ret[5][i], ret[3][i])
-                if key not in seen:
-                    seen.add(key)
-                    loads.append({
-                        "load_pattern": ret[2][i],
-                        "direction": ret[4][i],
-                        "value": ret[5][i],
-                        "csys": ret[3][i],
-                    })
-            loads = _filter_internal_patterns(loads)
-            if loads:
-                return loads
+                loads.append({
+                    "load_pattern": ret[2][i],
+                    "direction": ret[4][i],
+                    "value": ret[5][i],
+                    "csys": ret[3][i],
+                })
+            return loads
     except Exception:
         pass
 

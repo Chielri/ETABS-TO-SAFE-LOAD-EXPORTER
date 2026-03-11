@@ -101,20 +101,25 @@ def get_shell_uniform_loads(etabs_model, area_name):
         logger.debug("  GetLoadUniform exception: %s", e)
 
     # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
+    #    NOTE: This returns one entry per mesh element, so we must deduplicate.
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         logger.debug("  AreaElm.GetLoadUniform raw return: %s", ret)
         retcode = ret[-1]
         number_items = ret[0]
         if retcode == 0 and number_items > 0:
+            seen = set()
             loads = []
             for i in range(number_items):
-                loads.append({
-                    "load_pattern": ret[2][i],
-                    "direction": ret[4][i],
-                    "value": ret[5][i],
-                    "csys": ret[3][i],
-                })
+                key = (ret[2][i], ret[4][i], ret[5][i], ret[3][i])
+                if key not in seen:
+                    seen.add(key)
+                    loads.append({
+                        "load_pattern": ret[2][i],
+                        "direction": ret[4][i],
+                        "value": ret[5][i],
+                        "csys": ret[3][i],
+                    })
             return loads
         logger.debug("  AreaElm.GetLoadUniform: retcode=%s, items=%s", retcode, number_items)
     except Exception as e:

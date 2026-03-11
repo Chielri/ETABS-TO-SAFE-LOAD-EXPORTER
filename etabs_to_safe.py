@@ -88,6 +88,11 @@ def get_etabs_label(etabs_model, area_name):
     return label, story
 
 
+def _filter_internal_patterns(loads):
+    """Remove ETABS internal load patterns (e.g. ~LLRF) from results."""
+    return [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
+
+
 def get_shell_uniform_loads(etabs_model, area_name):
     """Get all shell uniform loads assigned to an area object in ETABS.
 
@@ -108,7 +113,9 @@ def get_shell_uniform_loads(etabs_model, area_name):
                     "value": ret[5][i],
                     "csys": ret[3][i],
                 })
-            return loads
+            loads = _filter_internal_patterns(loads)
+            if loads:
+                return loads
     except Exception as e:
         print(f"  DEBUG: GetLoadUniform exception: {e}")
 
@@ -131,7 +138,9 @@ def get_shell_uniform_loads(etabs_model, area_name):
                         "value": ret[5][i],
                         "csys": ret[3][i],
                     })
-            return loads
+            loads = _filter_internal_patterns(loads)
+            if loads:
+                return loads
     except Exception:
         pass
 
@@ -204,6 +213,9 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
         "Area Loads - Uniform Shell",
         "Shell Uniform Load Assignments",
         "Area Load Assignments - Uniform - Shell",
+        "Area Load Set Assignments - Shell",
+        "Shell Load Set Assignments",
+        "Area Load Assignments - Load Sets",
     ]
     tables_to_try = candidate_tables + [n for n in known if n not in candidate_tables]
 

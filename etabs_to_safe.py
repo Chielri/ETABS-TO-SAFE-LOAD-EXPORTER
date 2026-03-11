@@ -166,6 +166,11 @@ _DIR_STR_TO_INT = {
 }
 
 
+def _filter_internal_patterns(loads):
+    """Remove internal load patterns (those starting with '~')."""
+    return [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
+
+
 def _parse_direction(raw):
     """Convert a direction value (int, float-string, or descriptive string) to int."""
     if isinstance(raw, (int, float)):

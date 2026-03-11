@@ -4,12 +4,16 @@ ETABS to SAFE Shell Uniform Load Exporter - GUI Version
 Tkinter GUI with logging panel, debug toggle, and export functionality.
 """
 
+import csv
 import logging
+import os
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext
 import sys
 import traceback
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Core logic (identical to etabs_to_safe.py but uses logging instead of print)
@@ -25,11 +29,37 @@ DIR_NAMES = {
 }
 
 
-def connect_to_etabs():
+def find_running_processes(exe_name):
+    """Find running processes by executable name. Returns list of (pid, name) tuples."""
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/fi", f"imagename eq {exe_name}", "/fo", "csv", "/nh"],
+            text=True, stderr=subprocess.DEVNULL, creationflags=0x08000000,
+        )
+        results = []
+        for line in output.strip().splitlines():
+            if not line.strip() or "No tasks" in line or "INFO:" in line:
+                continue
+            parts = line.strip().strip('"').split('","')
+            if len(parts) >= 2:
+                try:
+                    results.append((int(parts[1]), parts[0]))
+                except ValueError:
+                    pass
+        return results
+    except Exception:
+        return []
+
+
+def connect_to_etabs(pid=None):
     import comtypes.client
     helper = comtypes.client.CreateObject("ETABSv1.Helper")
     helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
-    etabs_object = helper.GetObject("CSI.ETABS.API.ETABSObject")
+    if pid:
+        logger.info("Connecting to ETABS with PID %s...", pid)
+        etabs_object = helper.GetObjectProcess("CSI.ETABS.API.ETABSObject", pid)
+    else:
+        etabs_object = helper.GetObject("CSI.ETABS.API.ETABSObject")
     if etabs_object is None:
         raise RuntimeError(
             "Could not connect to ETABS. Make sure ETABS is running with a model open."
@@ -39,12 +69,16 @@ def connect_to_etabs():
     return etabs_object, sap_model
 
 
-def connect_to_safe():
+def connect_to_safe(pid=None):
     import comtypes.client
     helper = comtypes.client.CreateObject("SAFEv1.Helper")
     helper = helper.QueryInterface(comtypes.gen.SAFEv1.cHelper)
     # NOTE: SAFE reuses ETABS API infrastructure — the ProgID is "ETABSObject", not "SAFEObject"
-    safe_object = helper.GetObject("CSI.SAFE.API.ETABSObject")
+    if pid:
+        logger.info("Connecting to SAFE with PID %s...", pid)
+        safe_object = helper.GetObjectProcess("CSI.SAFE.API.ETABSObject", pid)
+    else:
+        safe_object = helper.GetObject("CSI.SAFE.API.ETABSObject")
     if safe_object is None:
         raise RuntimeError(
             "Could not connect to SAFE. Make sure SAFE is running with a model open."
@@ -155,6 +189,11 @@ _DIR_STR_TO_INT = {
     "projected-z": 9, "projected z": 9,
     "gravity projected": 10,
 }
+
+
+def _filter_internal_patterns(loads):
+    """Remove internal load patterns (those starting with '~')."""
+    return [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
 
 
 def _parse_direction(raw):
@@ -491,10 +530,10 @@ def _assign_load_via_tables(safe_model, slab_name, load):
         return -1
 
 
-def run_export(progress_callback=None):
+def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
     """Main export logic. Returns a summary dict. Raises on error."""
-    etabs_obj, etabs_model = connect_to_etabs()
-    safe_obj, safe_model = connect_to_safe()
+    etabs_obj, etabs_model = connect_to_etabs(pid=etabs_pid)
+    safe_obj, safe_model = connect_to_safe(pid=safe_pid)
 
     selected_areas = get_selected_area_names(etabs_model)
     safe_area_names = get_safe_area_names(safe_model)
@@ -505,14 +544,27 @@ def run_export(progress_callback=None):
     unmatched = 0
     loads_assigned = 0
     total = len(selected_areas)
+    csv_rows = []
 
     for idx, area_name in enumerate(selected_areas):
         label, story = get_etabs_label(etabs_model, area_name)
         logger.info("ETABS slab: '%s' (Label: '%s', Story: '%s')", area_name, label, story)
+        logger.info("  Level: %s", story if story else "N/A")
 
         loads = get_shell_uniform_loads(etabs_model, area_name)
         if not loads:
             logger.info("  No uniform loads assigned. Skipping.")
+            csv_rows.append({
+                "ETABS_UniqueName": area_name,
+                "ETABS_Label": label,
+                "Level": story,
+                "LoadPattern": "",
+                "Direction": "",
+                "Value": "",
+                "CSys": "",
+                "SAFE_SlabName": "",
+                "Assignment_Status": "No loads",
+            })
             if progress_callback:
                 progress_callback(idx + 1, total)
             continue
@@ -531,6 +583,19 @@ def run_export(progress_callback=None):
                 logger.warning("  No matching slab in SAFE (tried '%s' and '%s'). Skipping.",
                                label, area_name)
                 unmatched += 1
+                for load in loads:
+                    dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
+                    csv_rows.append({
+                        "ETABS_UniqueName": area_name,
+                        "ETABS_Label": label,
+                        "Level": story,
+                        "LoadPattern": load["load_pattern"],
+                        "Direction": dir_name,
+                        "Value": load["value"],
+                        "CSys": load["csys"],
+                        "SAFE_SlabName": "",
+                        "Assignment_Status": "Unmatched",
+                    })
                 if progress_callback:
                     progress_callback(idx + 1, total)
                 continue
@@ -542,12 +607,26 @@ def run_export(progress_callback=None):
             existing_patterns = ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns)
             ret = assign_load_to_safe(safe_model, safe_slab_name, load)
+            dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             if ret == 0:
                 loads_assigned += 1
                 logger.info("  Assigned: Pattern='%s', Value=%.4f -> OK",
                             load["load_pattern"], load["value"])
+                status = "OK"
             else:
                 logger.error("  FAILED: Pattern='%s' (ret=%s)", load["load_pattern"], ret)
+                status = f"FAILED (ret={ret})"
+            csv_rows.append({
+                "ETABS_UniqueName": area_name,
+                "ETABS_Label": label,
+                "Level": story,
+                "LoadPattern": load["load_pattern"],
+                "Direction": dir_name,
+                "Value": load["value"],
+                "CSys": load["csys"],
+                "SAFE_SlabName": safe_slab_name,
+                "Assignment_Status": status,
+            })
 
         if progress_callback:
             progress_callback(idx + 1, total)
@@ -559,9 +638,25 @@ def run_export(progress_callback=None):
         "matched": matched,
         "unmatched": unmatched,
         "loads_assigned": loads_assigned,
+        "csv_rows": csv_rows,
     }
-    logger.info("SUMMARY: %s", summary)
+    logger.info("SUMMARY: Selected=%d, Matched=%d, Unmatched=%d, Loads assigned=%d",
+                total, matched, unmatched, loads_assigned)
     return summary
+
+
+def write_export_csv(csv_rows, filepath):
+    """Write the export report CSV file."""
+    fieldnames = [
+        "ETABS_UniqueName", "ETABS_Label", "Level",
+        "LoadPattern", "Direction", "Value", "CSys",
+        "SAFE_SlabName", "Assignment_Status",
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+    logger.info("CSV report saved to %s (%d rows)", filepath, len(csv_rows))
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +688,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ETABS to SAFE - Shell Uniform Load Exporter")
-        self.geometry("750x520")
+        self.geometry("780x620")
         self.resizable(True, True)
         self._running = False
         self._build_ui()
@@ -618,6 +713,43 @@ class App(tk.Tk):
         self.debug_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Debug", variable=self.debug_var,
                         command=self._toggle_debug).pack(side=tk.LEFT, padx=(16, 0))
+
+        # --- API Status Frame ---
+        status_frame = ttk.LabelFrame(self, text="API Connection Status", padding=8)
+        status_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        # ETABS row
+        etabs_row = ttk.Frame(status_frame)
+        etabs_row.pack(fill=tk.X, pady=2)
+        ttk.Label(etabs_row, text="ETABS:", width=7).pack(side=tk.LEFT)
+        self.etabs_status_var = tk.StringVar(value="Not checked")
+        ttk.Label(etabs_row, textvariable=self.etabs_status_var,
+                  width=50, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(etabs_row, text="PID:").pack(side=tk.LEFT)
+        self.etabs_pid_var = tk.StringVar(value="")
+        self.etabs_pid_entry = ttk.Entry(etabs_row, textvariable=self.etabs_pid_var, width=8)
+        self.etabs_pid_entry.pack(side=tk.LEFT, padx=(2, 0))
+
+        # SAFE row
+        safe_row = ttk.Frame(status_frame)
+        safe_row.pack(fill=tk.X, pady=2)
+        ttk.Label(safe_row, text="SAFE:", width=7).pack(side=tk.LEFT)
+        self.safe_status_var = tk.StringVar(value="Not checked")
+        ttk.Label(safe_row, textvariable=self.safe_status_var,
+                  width=50, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(safe_row, text="PID:").pack(side=tk.LEFT)
+        self.safe_pid_var = tk.StringVar(value="")
+        self.safe_pid_entry = ttk.Entry(safe_row, textvariable=self.safe_pid_var, width=8)
+        self.safe_pid_entry.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Refresh button
+        btn_row = ttk.Frame(status_frame)
+        btn_row.pack(fill=tk.X, pady=(4, 0))
+        self.refresh_btn = ttk.Button(btn_row, text="Refresh Status",
+                                       command=self._on_refresh_status)
+        self.refresh_btn.pack(side=tk.LEFT)
+        ttk.Label(btn_row, text="(Leave PID empty for active instance)",
+                  foreground="#888888").pack(side=tk.LEFT, padx=(8, 0))
 
         # Progress bar
         self.progress = ttk.Progressbar(self, mode="determinate")
@@ -654,11 +786,105 @@ class App(tk.Tk):
 
     # -- Actions -------------------------------------------------------------
 
+    def _get_etabs_pid(self):
+        """Get ETABS PID from entry field, or None for active instance."""
+        val = self.etabs_pid_var.get().strip()
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                logger.warning("Invalid ETABS PID '%s', using active instance.", val)
+        return None
+
+    def _get_safe_pid(self):
+        """Get SAFE PID from entry field, or None for active instance."""
+        val = self.safe_pid_var.get().strip()
+        if val:
+            try:
+                return int(val)
+            except ValueError:
+                logger.warning("Invalid SAFE PID '%s', using active instance.", val)
+        return None
+
+    def _on_refresh_status(self):
+        if self._running:
+            return
+        self._running = True
+        self.refresh_btn.configure(state="disabled")
+        self.run_btn.configure(state="disabled")
+        self.etabs_status_var.set("Checking...")
+        self.safe_status_var.set("Checking...")
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
+
+    def _refresh_worker(self):
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            try:
+                self._check_etabs_status()
+                self._check_safe_status()
+            finally:
+                comtypes.CoUninitialize()
+        except Exception as e:
+            logger.error("Status check failed: %s", e)
+            logger.debug(traceback.format_exc())
+        finally:
+            self.after(0, self._on_refresh_done)
+
+    def _check_etabs_status(self):
+        # Show running ETABS processes
+        procs = find_running_processes("ETABS.exe")
+        if procs:
+            pid_list = ", ".join(str(p[0]) for p in procs)
+            logger.info("ETABS processes found: %s", pid_list)
+
+        try:
+            etabs_pid = self._get_etabs_pid()
+            _, etabs_model = connect_to_etabs(pid=etabs_pid)
+            model_file = etabs_model.GetModelFilename()
+            # Find matching PID from process list
+            display_pid = etabs_pid if etabs_pid else (procs[0][0] if len(procs) == 1 else None)
+            pid_text = f"PID {display_pid}" if display_pid else "Active instance"
+            status = f"Connected ({pid_text}) - {os.path.basename(model_file)}"
+            self.after(0, self.etabs_status_var.set, status)
+            if display_pid and not self.etabs_pid_var.get().strip():
+                self.after(0, self.etabs_pid_var.set, str(display_pid))
+        except Exception as e:
+            self.after(0, self.etabs_status_var.set, f"Disconnected - {e}")
+            logger.warning("ETABS connection check failed: %s", e)
+
+    def _check_safe_status(self):
+        # Show running SAFE processes
+        procs = find_running_processes("SAFE.exe")
+        if procs:
+            pid_list = ", ".join(str(p[0]) for p in procs)
+            logger.info("SAFE processes found: %s", pid_list)
+
+        try:
+            safe_pid = self._get_safe_pid()
+            _, safe_model = connect_to_safe(pid=safe_pid)
+            model_file = safe_model.GetModelFilename()
+            display_pid = safe_pid if safe_pid else (procs[0][0] if len(procs) == 1 else None)
+            pid_text = f"PID {display_pid}" if display_pid else "Active instance"
+            status = f"Connected ({pid_text}) - {os.path.basename(model_file)}"
+            self.after(0, self.safe_status_var.set, status)
+            if display_pid and not self.safe_pid_var.get().strip():
+                self.after(0, self.safe_pid_var.set, str(display_pid))
+        except Exception as e:
+            self.after(0, self.safe_status_var.set, f"Disconnected - {e}")
+            logger.warning("SAFE connection check failed: %s", e)
+
+    def _on_refresh_done(self):
+        self._running = False
+        self.refresh_btn.configure(state="normal")
+        self.run_btn.configure(state="normal")
+
     def _on_run(self):
         if self._running:
             return
         self._running = True
         self.run_btn.configure(state="disabled")
+        self.refresh_btn.configure(state="disabled")
         self.progress["value"] = 0
         self.status_var.set("Running...")
         threading.Thread(target=self._run_worker, daemon=True).start()
@@ -668,7 +894,13 @@ class App(tk.Tk):
             import comtypes
             comtypes.CoInitialize()
             try:
-                summary = run_export(progress_callback=self._update_progress)
+                etabs_pid = self._get_etabs_pid()
+                safe_pid = self._get_safe_pid()
+                summary = run_export(
+                    progress_callback=self._update_progress,
+                    etabs_pid=etabs_pid,
+                    safe_pid=safe_pid,
+                )
                 self.after(0, self._on_done, summary)
             finally:
                 comtypes.CoUninitialize()
@@ -688,16 +920,47 @@ class App(tk.Tk):
     def _on_done(self, summary):
         self._running = False
         self.run_btn.configure(state="normal")
+        self.refresh_btn.configure(state="normal")
         self.progress["value"] = 100
-        self.status_var.set(
+
+        # Auto-save CSV report
+        csv_rows = summary.get("csv_rows", [])
+        csv_path = ""
+        if csv_rows:
+            csv_path = self._save_csv(csv_rows)
+
+        status_msg = (
             f"Done! Matched: {summary['matched']}, "
             f"Unmatched: {summary['unmatched']}, "
             f"Loads assigned: {summary['loads_assigned']}"
         )
+        if csv_path:
+            status_msg += f" | CSV: {os.path.basename(csv_path)}"
+        self.status_var.set(status_msg)
+
+    def _save_csv(self, csv_rows):
+        """Save the CSV export report. Returns the file path or empty string."""
+        from tkinter import filedialog
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"ETABS_to_SAFE_Report_{timestamp}.csv"
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=default_name,
+            title="Save Export Report CSV",
+        )
+        if path:
+            try:
+                write_export_csv(csv_rows, path)
+                return path
+            except Exception as e:
+                logger.error("Failed to save CSV: %s", e)
+        return ""
 
     def _on_error(self, msg):
         self._running = False
         self.run_btn.configure(state="normal")
+        self.refresh_btn.configure(state="normal")
         self.progress["value"] = 0
         self.status_var.set(f"Error: {msg}")
 

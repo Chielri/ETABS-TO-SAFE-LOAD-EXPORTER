@@ -265,7 +265,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
 
-        loads = _filter_internal_patterns(loads)
+        loads = [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
         if loads:
             print(f"  Found {len(loads)} load(s) via database table '{table_name}'")
             return loads

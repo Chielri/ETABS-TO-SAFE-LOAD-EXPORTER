@@ -263,7 +263,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
             loads.append(load)
             logger.debug("  Direct table row match: %s", load)
 
-        loads = _filter_internal_patterns(loads)
+        loads = [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
         if loads:
             logger.info("  Found %d load(s) via direct table '%s'", len(loads), table_name)
             return loads

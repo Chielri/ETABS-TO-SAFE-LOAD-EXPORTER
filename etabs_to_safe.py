@@ -91,42 +91,208 @@ def get_etabs_label(etabs_model, area_name):
 def get_shell_uniform_loads(etabs_model, area_name):
     """Get all shell uniform loads assigned to an area object in ETABS.
 
+    Tries direct API first, then falls back to database tables for Load Sets.
     Returns a list of dicts with load details.
     """
-    ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
-    # ret layout: (NumberItems, AreaName, LoadPat, CSys, Dir, Value, retcode)
-    retcode = ret[-1]
-    number_items = ret[0]
-    if retcode != 0 or number_items == 0:
-        return []
-    load_pats = ret[2]
-    csys = ret[3]
-    dirs = ret[4]
-    values = ret[5]
+    # 1) Try the standard direct API call
+    try:
+        ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            loads = []
+            for i in range(number_items):
+                loads.append({
+                    "load_pattern": ret[2][i],
+                    "direction": ret[4][i],
+                    "value": ret[5][i],
+                    "csys": ret[3][i],
+                })
+            return loads
+    except Exception as e:
+        print(f"  DEBUG: GetLoadUniform exception: {e}")
 
-    loads = []
-    for i in range(number_items):
-        loads.append({
-            "load_pattern": load_pats[i],
-            "direction": dirs[i],
-            "value": values[i],
-            "csys": csys[i],
-        })
-    return loads
+    # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
+    try:
+        ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            loads = []
+            for i in range(number_items):
+                loads.append({
+                    "load_pattern": ret[2][i],
+                    "direction": ret[4][i],
+                    "value": ret[5][i],
+                    "csys": ret[3][i],
+                })
+            return loads
+    except Exception:
+        pass
+
+    # 3) Fallback: database tables (catches loads assigned via Load Sets)
+    return _get_uniform_loads_from_tables(etabs_model, area_name)
+
+
+# Direction string-to-int mapping for database table values
+_DIR_STR_TO_INT = {
+    "gravity": 6, "grav": 6,
+    "local-1": 1, "local 1": 1, "1": 1,
+    "local-2": 2, "local 2": 2, "2": 2,
+    "local-3": 3, "local 3": 3, "3": 3,
+    "global-x": 4, "global x": 4, "x": 4,
+    "global-y": 5, "global y": 5, "y": 5,
+    "global-z": 6, "global z": 6, "z": 6,
+    "projected-x": 7, "projected x": 7,
+    "projected-y": 8, "projected y": 8,
+    "projected-z": 9, "projected z": 9,
+    "gravity projected": 10,
+}
+
+
+def _parse_direction(raw):
+    """Convert a direction value (int, float-string, or descriptive string) to int."""
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    try:
+        return int(float(raw))
+    except (ValueError, TypeError):
+        pass
+    return _DIR_STR_TO_INT.get(str(raw).strip().lower(), 6)
+
+
+def _find_column(fields, *candidates):
+    """Find the index of a column by trying multiple candidate names (case-insensitive)."""
+    lower_fields = [f.lower().strip() for f in fields]
+    for c in candidates:
+        cl = c.lower()
+        for idx, fl in enumerate(lower_fields):
+            if fl == cl:
+                return idx
+    for c in candidates:
+        cl = c.lower()
+        for idx, fl in enumerate(lower_fields):
+            if cl in fl:
+                return idx
+    return None
+
+
+def _get_uniform_loads_from_tables(etabs_model, area_name):
+    """Retrieve shell uniform loads via ETABS database tables API."""
+    db = etabs_model.DatabaseTables
+
+    candidate_tables = []
+    try:
+        ret = db.GetAvailableTables(0, [], [], [])
+        if ret[-1] == 0 and ret[1]:
+            for t in ret[1]:
+                tl = t.lower()
+                if "uniform" in tl and ("area" in tl or "shell" in tl):
+                    candidate_tables.append(t)
+                elif "load set" in tl and ("area" in tl or "shell" in tl):
+                    candidate_tables.append(t)
+    except Exception:
+        pass
+
+    known = [
+        "Area Load Assignments - Uniform Shell",
+        "Area Loads - Uniform Shell",
+        "Shell Uniform Load Assignments",
+        "Area Load Assignments - Uniform - Shell",
+    ]
+    tables_to_try = candidate_tables + [n for n in known if n not in candidate_tables]
+
+    for table_name in tables_to_try:
+        loads = _query_table_for_loads(db, table_name, area_name)
+        if loads:
+            print(f"  Found {len(loads)} load(s) via database table '{table_name}'")
+            return loads
+
+    return []
+
+
+def _query_table_for_loads(db, table_name, area_name):
+    """Query a single database table for uniform loads matching area_name."""
+    try:
+        # Signature: (TableKey, FieldKeyList[], GroupName, TableVersion, FieldsKeysIncluded[], NumberRecords, TableData[])
+        # Returns:   (FieldKeyList, TableVersion, FieldsKeysIncluded, NumberRecords, TableData, retcode)
+        ret = db.GetTableForDisplayArray(table_name, [], "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return []
+
+        fields = list(ret[2]) if ret[2] else []
+        num_records = ret[3]
+        table_data = list(ret[4]) if ret[4] else []
+
+        if not fields or num_records == 0:
+            return []
+
+        num_fields = len(fields)
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName", "Name")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
+        dir_col = _find_column(fields, "Dir", "Direction")
+        val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value", "Load")
+        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+
+        if name_col is None:
+            return []
+
+        loads = []
+        for row in range(num_records):
+            start = row * num_fields
+            row_data = table_data[start:start + num_fields]
+            if len(row_data) < num_fields:
+                continue
+            if row_data[name_col] != area_name:
+                continue
+            loads.append({
+                "load_pattern": row_data[pat_col] if pat_col is not None else "Unknown",
+                "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
+                "value": float(row_data[val_col]) if val_col is not None else 0.0,
+                "csys": row_data[csys_col] if csys_col is not None else "Global",
+            })
+
+        return loads
+    except Exception:
+        return []
 
 
 def get_safe_area_names(safe_model):
     """Get all area object names in SAFE and return as a set for fast lookup."""
-    ret = safe_model.AreaObj.GetNameList(0, [])
-    # ret: (NumberNames, MyName, retcode)
-    retcode = ret[-1]
-    if retcode != 0:
-        print(f"WARNING: Failed to get area names from SAFE (ret={retcode}).")
-        return set()
-    names = ret[1]
-    name_set = set(names) if names else set()
-    print(f"Found {len(name_set)} area object(s) in SAFE.")
-    return name_set
+    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
+    try:
+        ret = safe_model.AreaObj.GetNameList(0, [])
+        retcode = ret[-1]
+        if retcode == 0 and ret[1]:
+            name_set = set(ret[1])
+            print(f"Found {len(name_set)} area object(s) in SAFE.")
+            return name_set
+    except Exception:
+        pass
+
+    # Fallback: database tables (required for SAFE v22+)
+    try:
+        db = safe_model.DatabaseTables
+        ret = db.GetTableForDisplayArray("Objects and Elements - Areas", [], "", 0, [], 0, [])
+        if ret[-1] == 0 and ret[4]:
+            fields = list(ret[2]) if ret[2] else []
+            num_records = ret[3]
+            table_data = list(ret[4])
+            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+            if name_col is not None:
+                num_fields = len(fields)
+                name_set = set()
+                for row in range(num_records):
+                    start = row * num_fields
+                    if start + name_col < len(table_data):
+                        name_set.add(table_data[start + name_col])
+                print(f"Found {len(name_set)} area object(s) in SAFE (via tables).")
+                return name_set
+    except Exception:
+        pass
+
+    print("WARNING: Failed to get area names from SAFE.")
+    return set()
 
 
 def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
@@ -158,22 +324,76 @@ def get_existing_load_patterns(safe_model):
 def assign_load_to_safe(safe_model, slab_name, load):
     """Assign a single shell uniform load to a slab in SAFE.
 
-    SetLoadUniform(Name, LoadPat, Value, Dir, Replace, CSys)
-    Replace=True replaces existing load of same pattern, False adds to it.
+    Tries COM AreaObj first, then falls back to database tables.
     Returns 0 on success, non-zero on failure.
     """
-    ret = safe_model.AreaObj.SetLoadUniform(
-        slab_name,
-        load["load_pattern"],
-        load["value"],
-        load["direction"],
-        True,  # Replace existing load for this pattern
-        load["csys"],
-    )
-    # COM may return a tuple; the status code is the last element
-    if isinstance(ret, (tuple, list)):
-        return ret[-1]
-    return ret
+    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
+    try:
+        ret = safe_model.AreaObj.SetLoadUniform(
+            slab_name,
+            load["load_pattern"],
+            load["value"],
+            load["direction"],
+            True,
+            load["csys"],
+        )
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode == 0:
+            return 0
+    except Exception:
+        pass
+
+    # Fallback: database tables (required for SAFE v22+)
+    return _assign_load_via_tables(safe_model, slab_name, load)
+
+
+def _assign_load_via_tables(safe_model, slab_name, load):
+    """Assign a uniform load to SAFE via database tables API."""
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+
+        ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return ret[-1]
+
+        table_version = ret[0]
+        fields = list(ret[1]) if ret[1] else []
+        num_records = ret[2]
+        table_data = list(ret[3]) if ret[3] else []
+
+        if not fields:
+            return -1
+
+        num_fields = len(fields)
+
+        new_row = [""] * num_fields
+        for idx, f in enumerate(fields):
+            fl = f.lower().strip()
+            if fl in ("uniquename", "unique name", "name"):
+                new_row[idx] = slab_name
+            elif fl in ("loadpat", "load pattern", "loadpattern"):
+                new_row[idx] = load["load_pattern"]
+            elif fl in ("dir", "direction"):
+                new_row[idx] = str(load["direction"])
+            elif fl in ("unifload", "uniform load", "value"):
+                new_row[idx] = str(load["value"])
+            elif fl in ("csys", "coordsys", "coord sys"):
+                new_row[idx] = load["csys"]
+
+        num_records += 1
+        table_data.extend(new_row)
+
+        ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode != 0:
+            return retcode
+
+        ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        return retcode
+    except Exception:
+        return -1
 
 
 DIR_NAMES = {

@@ -21,6 +21,8 @@ def connect_to_etabs():
         helper = comtypes.client.CreateObject("ETABSv1.Helper")
         helper = helper.QueryInterface(comtypes.gen.ETABSv1.cHelper)
         etabs_object = helper.GetObject("CSI.ETABS.API.ETABSObject")
+        if etabs_object is None:
+            raise RuntimeError("ETABS returned no application object.")
         sap_model = etabs_object.SapModel
         print(f"Connected to ETABS: {sap_model.GetModelFilename()}")
         return etabs_object, sap_model
@@ -35,6 +37,8 @@ def connect_to_safe():
         helper = comtypes.client.CreateObject("SAFEv1.Helper")
         helper = helper.QueryInterface(comtypes.gen.SAFEv1.cHelper)
         safe_object = helper.GetObject("CSI.SAFE.API.SAFEObject")
+        if safe_object is None:
+            raise RuntimeError("SAFE returned no application object.")
         sap_model = safe_object.SapModel
         print(f"Connected to SAFE: {sap_model.GetModelFilename()}")
         return safe_object, sap_model

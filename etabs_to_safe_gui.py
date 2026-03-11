@@ -47,6 +47,10 @@ def connect_to_safe():
 
 def get_selected_area_names(etabs_model):
     ret = etabs_model.SelectObj.GetSelected(0, [], [])
+    # ret: (NumberItems, ObjectType, ObjectName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        raise RuntimeError(f"Failed to get selection from ETABS (ret={retcode}).")
     number_items, object_type, object_name = ret[0], ret[1], ret[2]
     area_names = [object_name[i] for i in range(number_items) if object_type[i] == 5]
     if not area_names:
@@ -57,6 +61,11 @@ def get_selected_area_names(etabs_model):
 
 def get_etabs_label(etabs_model, area_name):
     ret = etabs_model.AreaObj.GetLabelFromName(area_name, "", "")
+    # ret: (Label, Story, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        logger.warning("  GetLabelFromName failed for '%s' (ret=%s).", area_name, retcode)
+        return area_name, ""
     return ret[0], ret[1]
 
 
@@ -79,6 +88,11 @@ def get_shell_uniform_loads(etabs_model, area_name):
 
 def get_safe_area_names(safe_model):
     ret = safe_model.AreaObj.GetNameList(0, [])
+    # ret: (NumberNames, MyName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        logger.warning("Failed to get area names from SAFE (ret=%s).", retcode)
+        return set()
     names = ret[1]
     name_set = set(names) if names else set()
     logger.info("Found %d area object(s) in SAFE.", len(name_set))
@@ -87,6 +101,11 @@ def get_safe_area_names(safe_model):
 
 def get_existing_load_patterns(safe_model):
     ret = safe_model.LoadPatterns.GetNameList(0, [])
+    # ret: (NumberNames, MyName, retcode)
+    retcode = ret[-1]
+    if retcode != 0:
+        logger.warning("Failed to get load patterns from SAFE (ret=%s).", retcode)
+        return set()
     names = ret[1]
     return set(names) if names else set()
 

@@ -714,6 +714,10 @@ class App(tk.Tk):
         ttk.Checkbutton(top, text="Debug", variable=self.debug_var,
                         command=self._toggle_debug).pack(side=tk.LEFT, padx=(16, 0))
 
+        self.csv_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="CSV Report", variable=self.csv_var
+                        ).pack(side=tk.LEFT, padx=(8, 0))
+
         # --- API Status Frame ---
         status_frame = ttk.LabelFrame(self, text="API Connection Status", padding=8)
         status_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
@@ -923,10 +927,10 @@ class App(tk.Tk):
         self.refresh_btn.configure(state="normal")
         self.progress["value"] = 100
 
-        # Auto-save CSV report
+        # Save CSV report if enabled
         csv_rows = summary.get("csv_rows", [])
         csv_path = ""
-        if csv_rows:
+        if csv_rows and self.csv_var.get():
             csv_path = self._save_csv(csv_rows)
 
         status_msg = (

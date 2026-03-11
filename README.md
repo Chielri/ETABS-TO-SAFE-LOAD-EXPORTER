@@ -35,32 +35,173 @@ Or just:
 pip install comtypes
 ```
 
-## Usage
+## Quick Start (for the Pre-built .exe)
 
-### GUI
+If you just want to run the tool without installing Python:
+
+1. Download **`ETABStoSAFE.exe`** from the [Releases](../../releases) page
+2. Open your structural model in **ETABS** and your foundation model in **SAFE**
+3. In ETABS, **select the slabs** you want to transfer loads from
+4. Double-click `ETABStoSAFE.exe` — the GUI opens
+5. Click **Run Export** — loads are transferred and you'll see results in the log
+
+No Python installation needed.
+
+---
+
+## Usage — GUI (Recommended)
+
+The GUI version provides a visual interface with real-time feedback. This is the recommended way to use the tool.
 
 ```bash
 python etabs_to_safe_gui.py
 ```
 
-1. Open your model in ETABS and your model in SAFE
-2. Click **Refresh Status** to verify both connections (the panel shows connection state, PID, and model filename)
-3. *(Optional)* Enter a specific **PID** to target a particular ETABS or SAFE instance
-4. Select the slabs in ETABS you want to export loads from
-5. Click **Run Export**
-6. If **CSV Report** is checked, a save dialog appears after export with the full report
-7. Check the **Debug** checkbox for verbose output
-8. Use **Save Log** to export the log to a file
+### Step-by-Step
 
-### CLI
+1. **Open both programs** — Launch ETABS with your structural model and SAFE with your foundation/slab model. Both must have their models open and visible.
+
+2. **Launch the tool** — Run `ETABStoSAFE.exe` or `python etabs_to_safe_gui.py`. The main window appears.
+
+3. **Check connections** — Click **Refresh Status**. The status panel shows whether ETABS and SAFE are connected, the model filename, and the process ID (PID).
+   - If you have **multiple ETABS or SAFE instances** open, enter the PID of the one you want in the PID field, then click Refresh Status again. You can find the PID in Windows Task Manager (Details tab).
+   - If you only have one instance of each, leave PID fields empty — it connects automatically.
+
+4. **Select slabs in ETABS** — Switch to ETABS and select the slabs (floor/shell objects) whose loads you want to export. You can select one slab, multiple slabs, or an entire floor.
+
+5. **Click Run Export** — The tool:
+   - Reads all shell uniform loads from each selected slab in ETABS
+   - Shows the **slab label, level/story, and all assigned loads** in the log
+   - Matches each ETABS slab to the corresponding slab in SAFE by label name
+   - Creates any load patterns in SAFE that don't already exist (e.g. Dead, Live, SDL)
+   - Assigns the loads to the matched slabs in SAFE
+   - Shows a progress bar and summary when done
+
+6. **Review the results** — The log panel shows every slab processed, its level, which loads were assigned, and any warnings (e.g. unmatched slabs). The status bar shows a final summary.
+
+7. **Save the CSV report** *(optional)* — If the **CSV Report** checkbox is checked, a Save dialog appears after export. The CSV file contains a complete record of every slab and load processed — useful for documentation or QA review.
+
+8. **Save the log** *(optional)* — Click **Save Log** to save the full text log to a `.txt` file.
+
+### GUI Options
+
+| Control | What it does |
+|---|---|
+| **Run Export** | Starts the load transfer process |
+| **Clear Log** | Clears the log panel |
+| **Save Log** | Saves the log text to a file |
+| **Debug** | Shows detailed/verbose messages in the log (for troubleshooting) |
+| **CSV Report** | When checked, prompts to save a CSV summary after export |
+| **Refresh Status** | Re-checks ETABS and SAFE connections and updates the status panel |
+| **PID fields** | Enter a specific process ID to connect to a particular ETABS/SAFE instance |
+
+---
+
+## Usage — CLI (Command Line)
+
+The CLI version runs entirely in the terminal with no graphical interface. It prints results directly to the console. This is useful for scripting or when you prefer a text-based workflow.
 
 ```bash
 python etabs_to_safe.py
 ```
 
-### Pre-built Executable
+### Step-by-Step
 
-Download `ETABStoSAFE.exe` from [Releases](../../releases) — no Python installation needed.
+1. **Open both programs** — Same as GUI: open ETABS with your structural model and SAFE with your foundation model.
+
+2. **Select slabs in ETABS** — In ETABS, select the slabs you want to export loads from. This must be done **before** running the script.
+
+3. **Open a Command Prompt** — Press `Win + R`, type `cmd`, press Enter. Navigate to the folder where the script is located:
+   ```
+   cd C:\path\to\ETABS-TO-SAFE-LOAD-EXPORTER
+   ```
+
+4. **Run the script**:
+   ```
+   python etabs_to_safe.py
+   ```
+
+5. **Read the output** — The script prints:
+   - Connection status for ETABS and SAFE
+   - For each selected slab: label, story, and all uniform loads found
+   - Whether each slab was matched in SAFE
+   - Whether each load was assigned successfully
+   - A final summary with counts
+
+### Example CLI Output
+
+```
+============================================================
+  ETABS to SAFE - Shell Uniform Load Exporter
+============================================================
+
+Connected to ETABS: MyBuilding.EDB
+Connected to SAFE: MyFoundation.fdb
+
+Found 3 selected area object(s) in ETABS.
+Found 45 area object(s) in SAFE.
+Existing load patterns in SAFE: {'Dead', 'Live'}
+
+ETABS slab: 'F1' (Label: 'F1', Story: 'Level 1')
+  Load: Pattern='Dead', Dir=Gravity, Value=2.5000
+  Load: Pattern='Live', Dir=Gravity, Value=3.0000
+  Matched to SAFE slab: 'F1'
+  Assigned: Pattern='Dead', Value=2.5000 -> OK
+  Assigned: Pattern='Live', Value=3.0000 -> OK
+
+ETABS slab: 'F2' (Label: 'F2', Story: 'Level 1')
+  Load: Pattern='Dead', Dir=Gravity, Value=2.5000
+  Matched to SAFE slab: 'F2'
+  Assigned: Pattern='Dead', Value=2.5000 -> OK
+
+ETABS slab: 'F3' (Label: 'F3', Story: 'Level 2')
+  No uniform loads assigned. Skipping.
+
+============================================================
+  SUMMARY
+  Selected slabs in ETABS:  3
+  Matched to SAFE:          2
+  Unmatched:                0
+  Loads assigned:           3
+============================================================
+Done!
+```
+
+### CLI vs GUI — Which to Use?
+
+| | GUI | CLI |
+|---|---|---|
+| Best for | Day-to-day use, visual feedback | Scripting, batch workflows |
+| Progress bar | Yes | No |
+| CSV report | Yes (toggle via checkbox) | No |
+| PID selection | Yes (entry fields) | No (uses active instance) |
+| Log export | Yes (Save Log button) | Copy/paste from terminal |
+| Debug mode | Yes (checkbox) | No |
+
+---
+
+## Slab Matching — How ETABS Slabs Map to SAFE Slabs
+
+Understanding how the tool matches slabs is important for getting correct results:
+
+1. The tool reads each selected slab's **label** from ETABS (via `GetLabelFromName`) — for example, a slab with unique name `"4"` on Story `"Level 1"` might have label `"F1"`.
+2. It looks for a slab in SAFE with that **same name** (`"F1"`).
+3. If no match is found by label, it tries the ETABS **unique name** (`"4"`) as a fallback.
+4. If neither matches, the slab is reported as **Unmatched** and skipped.
+
+**Tip:** For best results, make sure your SAFE slab names match your ETABS slab labels. You can check slab labels in ETABS under `Assign > Shell > Labels`.
+
+## Troubleshooting
+
+| Problem | Solution |
+|---|---|
+| **"Could not connect to ETABS"** | Make sure ETABS is running and a model is open (not just the start screen). If you have multiple ETABS instances, enter the correct PID. |
+| **"Could not connect to SAFE"** | Same as above but for SAFE. Make sure the SAFE model file (`.fdb`) is open. |
+| **"No area/shell objects selected in ETABS"** | Go to ETABS and select at least one slab/shell before running. Use click, box select, or `Select > Group` to select slabs. |
+| **Slabs show as "Unmatched"** | The slab label in ETABS doesn't match any slab name in SAFE. Check that naming is consistent between both models. See "Slab Matching" above. |
+| **Loads show as "FAILED"** | The load could not be assigned in SAFE. Check that the slab exists and is not locked. Enable Debug mode for more detail. |
+| **Wrong ETABS/SAFE instance connected** | If multiple instances are open, use **Refresh Status** and enter the correct PID in the GUI. Find PIDs in Windows Task Manager > Details tab. In ETABS/SAFE you can also go to `Tools > Active Instance for API` to set which instance responds. |
+| **Script says `comtypes` not found** | Run `pip install comtypes` in Command Prompt. Not needed if using the `.exe` version. |
 
 ## How It Works
 

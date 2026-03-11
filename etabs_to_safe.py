@@ -102,31 +102,47 @@ def get_shell_uniform_loads(etabs_model, area_name):
         if retcode == 0 and number_items > 0:
             loads = []
             for i in range(number_items):
+                pat = str(ret[2][i])
+                if pat.startswith("~"):
+                    continue
                 loads.append({
-                    "load_pattern": ret[2][i],
-                    "direction": ret[4][i],
-                    "value": ret[5][i],
-                    "csys": ret[3][i],
+                    "load_pattern": pat,
+                    "direction": int(ret[4][i]),
+                    "value": float(ret[5][i]),
+                    "csys": str(ret[3][i]),
                 })
-            return loads
+            if loads:
+                return loads
     except Exception as e:
         print(f"  DEBUG: GetLoadUniform exception: {e}")
 
     # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
+    #    NOTE: Returns one entry per mesh element, so we must deduplicate.
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
         number_items = ret[0]
         if retcode == 0 and number_items > 0:
+            seen = set()
             loads = []
             for i in range(number_items):
-                loads.append({
-                    "load_pattern": ret[2][i],
-                    "direction": ret[4][i],
-                    "value": ret[5][i],
-                    "csys": ret[3][i],
-                })
-            return loads
+                pat = str(ret[2][i])
+                if pat.startswith("~"):
+                    continue
+                direction = int(ret[4][i])
+                value = float(ret[5][i])
+                csys = str(ret[3][i])
+                key = (pat, direction, value, csys)
+                if key not in seen:
+                    seen.add(key)
+                    loads.append({
+                        "load_pattern": pat,
+                        "direction": direction,
+                        "value": value,
+                        "csys": csys,
+                    })
+            if loads:
+                return loads
     except Exception:
         pass
 

@@ -112,7 +112,25 @@ def get_shell_uniform_loads(etabs_model, area_name):
     except Exception as e:
         print(f"  DEBUG: GetLoadUniform exception: {e}")
 
-    # 2) Fallback: database tables (catches loads assigned via Load Sets)
+    # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
+    try:
+        ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            loads = []
+            for i in range(number_items):
+                loads.append({
+                    "load_pattern": ret[2][i],
+                    "direction": ret[4][i],
+                    "value": ret[5][i],
+                    "csys": ret[3][i],
+                })
+            return loads
+    except Exception:
+        pass
+
+    # 3) Fallback: database tables (catches loads assigned via Load Sets)
     return _get_uniform_loads_from_tables(etabs_model, area_name)
 
 

@@ -98,6 +98,34 @@ A GitHub Actions workflow is included that builds and uploads the executable aut
 | SAFE_SlabName | Matched slab name in SAFE |
 | Assignment_Status | OK, FAILED, Unmatched, or No loads |
 
+## Acknowledgements
+
+This project relies on the following software and APIs:
+
+- **[CSI ETABS](https://www.csiamerica.com/products/etabs)** and **[CSI SAFE](https://www.csiamerica.com/products/safe)** by Computers and Structures, Inc. (CSI) — This tool uses their public COM/API interfaces for automation. ETABS and SAFE are proprietary commercial software; a valid license for each is required. This project is not affiliated with or endorsed by CSI.
+
+### Python Dependencies
+
+| Package | License | Description |
+|---|---|---|
+| [Python](https://www.python.org/) | [PSF License](https://docs.python.org/3/license.html) | Python interpreter (3.10+) |
+| [comtypes](https://github.com/enthought/comtypes) | [MIT License](https://github.com/enthought/comtypes/blob/master/LICENSE.txt) | COM interface library used to communicate with ETABS and SAFE APIs |
+| [PyInstaller](https://pyinstaller.org/) | [GPL-2.0 with bootloader exception](https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt) | Bundles the app into a standalone `.exe`. The bootloader exception permits distribution of non-GPL applications |
+
+### Python Standard Library (no additional license)
+
+The following standard library modules are used and ship with Python under the PSF License: `tkinter`, `logging`, `threading`, `csv`, `os`, `subprocess`, `sys`, `traceback`, `datetime`.
+
+### Build & CI
+
+| Tool | License | Description |
+|---|---|---|
+| [GitHub Actions](https://github.com/features/actions) | GitHub Terms of Service | CI/CD for building releases |
+| [actions/checkout](https://github.com/actions/checkout) | [MIT License](https://github.com/actions/checkout/blob/main/LICENSE) | Checks out the repository |
+| [actions/setup-python](https://github.com/actions/setup-python) | [MIT License](https://github.com/actions/setup-python/blob/main/LICENSE) | Sets up Python in CI |
+| [actions/upload-artifact](https://github.com/actions/upload-artifact) | [MIT License](https://github.com/actions/upload-artifact/blob/main/LICENSE) | Uploads build artifacts |
+| [softprops/action-gh-release](https://github.com/softprops/action-gh-release) | [MIT License](https://github.com/softprops/action-gh-release/blob/master/LICENSE) | Attaches binaries to GitHub releases |
+
 ## License
 
 [The Unlicense](LICENSE) — public domain.

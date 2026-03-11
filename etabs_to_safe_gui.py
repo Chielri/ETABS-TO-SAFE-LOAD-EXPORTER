@@ -79,20 +79,165 @@ def get_etabs_label(etabs_model, area_name):
 
 
 def get_shell_uniform_loads(etabs_model, area_name):
-    ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
-    retcode = ret[-1]
-    number_items = ret[0]
-    if retcode != 0 or number_items == 0:
+    """Get shell uniform loads — tries direct API, then database tables for Load Sets."""
+    # 1) Try the standard direct API call
+    try:
+        ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
+        logger.debug("  GetLoadUniform raw return: %s", ret)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            loads = []
+            for i in range(number_items):
+                loads.append({
+                    "load_pattern": ret[2][i],
+                    "direction": ret[4][i],
+                    "value": ret[5][i],
+                    "csys": ret[3][i],
+                })
+            return loads
+        logger.debug("  GetLoadUniform: retcode=%s, items=%s", retcode, number_items)
+    except Exception as e:
+        logger.debug("  GetLoadUniform exception: %s", e)
+
+    # 2) Fallback: database tables (catches loads assigned via Load Sets)
+    logger.debug("  Trying database tables fallback for '%s'...", area_name)
+    return _get_uniform_loads_from_tables(etabs_model, area_name)
+
+
+# Direction string-to-int mapping for database table values
+_DIR_STR_TO_INT = {
+    "gravity": 6, "grav": 6,
+    "local-1": 1, "local 1": 1, "1": 1,
+    "local-2": 2, "local 2": 2, "2": 2,
+    "local-3": 3, "local 3": 3, "3": 3,
+    "global-x": 4, "global x": 4, "x": 4,
+    "global-y": 5, "global y": 5, "y": 5,
+    "global-z": 6, "global z": 6, "z": 6,
+    "projected-x": 7, "projected x": 7,
+    "projected-y": 8, "projected y": 8,
+    "projected-z": 9, "projected z": 9,
+    "gravity projected": 10,
+}
+
+
+def _parse_direction(raw):
+    """Convert a direction value (int, float-string, or descriptive string) to int."""
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    try:
+        return int(float(raw))
+    except (ValueError, TypeError):
+        pass
+    return _DIR_STR_TO_INT.get(str(raw).strip().lower(), 6)
+
+
+def _find_column(fields, *candidates):
+    """Find the index of a column by trying multiple candidate names (case-insensitive)."""
+    lower_fields = [f.lower().strip() for f in fields]
+    for c in candidates:
+        cl = c.lower()
+        for idx, fl in enumerate(lower_fields):
+            if fl == cl:
+                return idx
+    # Partial match fallback
+    for c in candidates:
+        cl = c.lower()
+        for idx, fl in enumerate(lower_fields):
+            if cl in fl:
+                return idx
+    return None
+
+
+def _get_uniform_loads_from_tables(etabs_model, area_name):
+    """Retrieve shell uniform loads via ETABS database tables API."""
+    db = etabs_model.DatabaseTables
+
+    # Discover candidate table names
+    candidate_tables = []
+    try:
+        ret = db.GetAvailableTables(0, [])
+        if ret[-1] == 0 and ret[1]:
+            for t in ret[1]:
+                tl = t.lower()
+                if "uniform" in tl and ("area" in tl or "shell" in tl):
+                    candidate_tables.append(t)
+                elif "load set" in tl and ("area" in tl or "shell" in tl):
+                    candidate_tables.append(t)
+            logger.debug("  Discovered load tables: %s", candidate_tables)
+    except Exception as e:
+        logger.debug("  GetAvailableTables error: %s", e)
+
+    # Also try well-known table names
+    known = [
+        "Area Load Assignments - Uniform Shell",
+        "Area Loads - Uniform Shell",
+        "Shell Uniform Load Assignments",
+        "Area Load Assignments - Uniform - Shell",
+    ]
+    tables_to_try = candidate_tables + [n for n in known if n not in candidate_tables]
+
+    for table_name in tables_to_try:
+        loads = _query_table_for_loads(db, table_name, area_name)
+        if loads:
+            logger.info("  Found %d load(s) via table '%s'", len(loads), table_name)
+            return loads
+
+    return []
+
+
+def _query_table_for_loads(db, table_name, area_name):
+    """Query a single database table for uniform loads matching area_name."""
+    try:
+        ret = db.GetTableForDisplayArray(table_name, "", "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return []
+
+        fields = list(ret[1]) if ret[1] else []
+        num_records = ret[2]
+        table_data = list(ret[3]) if ret[3] else []
+
+        if not fields or num_records == 0:
+            return []
+
+        logger.debug("  Table '%s': fields=%s, records=%d", table_name, fields, num_records)
+
+        num_fields = len(fields)
+
+        # Identify columns
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName", "Name")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
+        dir_col = _find_column(fields, "Dir", "Direction")
+        val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value", "Load")
+        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+
+        if name_col is None:
+            logger.debug("  No name column found in '%s'", table_name)
+            return []
+
+        loads = []
+        for row in range(num_records):
+            start = row * num_fields
+            row_data = table_data[start:start + num_fields]
+            if len(row_data) < num_fields:
+                continue
+
+            if row_data[name_col] != area_name:
+                continue
+
+            load = {
+                "load_pattern": row_data[pat_col] if pat_col is not None else "Unknown",
+                "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
+                "value": float(row_data[val_col]) if val_col is not None else 0.0,
+                "csys": row_data[csys_col] if csys_col is not None else "Global",
+            }
+            loads.append(load)
+            logger.debug("  Table row match: %s", load)
+
+        return loads
+    except Exception as e:
+        logger.debug("  Table '%s' query error: %s", table_name, e)
         return []
-    loads = []
-    for i in range(number_items):
-        loads.append({
-            "load_pattern": ret[2][i],
-            "direction": ret[4][i],
-            "value": ret[5][i],
-            "csys": ret[3][i],
-        })
-    return loads
 
 
 def get_safe_area_names(safe_model):

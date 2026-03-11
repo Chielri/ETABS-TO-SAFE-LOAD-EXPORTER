@@ -49,7 +49,7 @@ def get_selected_area_names(etabs_model):
     # ret: (NumberItems, ObjectType, ObjectName, retcode)
     retcode = ret[-1]
     if retcode != 0:
-        print("ERROR: Failed to get selection from ETABS (ret={retcode}).")
+        print(f"ERROR: Failed to get selection from ETABS (ret={retcode}).")
         sys.exit(1)
     number_items = ret[0]
     object_type = ret[1]

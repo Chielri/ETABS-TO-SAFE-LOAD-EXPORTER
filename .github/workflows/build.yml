@@ -8,6 +8,9 @@ on:
     types: [published]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -33,6 +36,16 @@ jobs:
         with:
           name: ETABStoSAFE
           path: dist/ETABStoSAFE.exe
+
+      - name: Commit exe to repo
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          copy dist\ETABStoSAFE.exe ETABStoSAFE.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ETABStoSAFE.exe
+          git diff --cached --quiet || git commit -m "Update ETABStoSAFE.exe [skip ci]"
+          git push
 
       - name: Upload to release
         if: github.event_name == 'release'

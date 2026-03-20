@@ -851,17 +851,46 @@ def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
     return []
 
 
-def bulk_delete_and_assign_loads(safe_model, deletions, assignments):
-    """Delete and assign loads in SAFE in a single table operation.
+def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
+    """Delete existing uniform loads from a SAFE slab for the given load patterns."""
+    deleted = 0
+    for pat in load_patterns:
+        try:
+            ret = safe_model.AreaObj.DeleteLoadUniform(slab_name, pat)
+            retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+            if retcode == 0:
+                deleted += 1
+                continue
+        except Exception:
+            pass
+    return deleted
 
-    deletions: dict of {slab_name: set of load_pattern_names to delete}
-    assignments: list of (slab_name, load_dict) tuples to add
 
-    Performs one Get → filter out deletions → append assignments → Set → Apply cycle.
-    Returns (num_deleted, num_assigned) on success, (0, 0) on failure.
+def assign_load_to_safe(safe_model, slab_name, load):
+    """Assign a single shell uniform load to a slab in SAFE.
+
+    Primary: COM AreaObj.SetLoadUniform (works via ETABS COM layer inheritance).
+    Fallback: database tables.
+    Returns 0 on success, non-zero on failure.
     """
-    if not deletions and not assignments:
-        return 0, 0
+    try:
+        ret = safe_model.AreaObj.SetLoadUniform(
+            slab_name, load["load_pattern"], load["value"],
+            load["direction"], True, load["csys"],
+        )
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode == 0:
+            return 0
+        logger.debug("  AreaObj.SetLoadUniform returned %s, trying database tables...", retcode)
+    except Exception as e:
+        logger.debug("  AreaObj.SetLoadUniform not available: %s", e)
+
+    # Fallback: database tables
+    return _assign_load_via_tables(safe_model, slab_name, load)
+
+
+def _assign_load_via_tables(safe_model, slab_name, load):
+    """Assign a uniform load via database tables (fallback)."""
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
@@ -869,7 +898,7 @@ def bulk_delete_and_assign_loads(safe_model, deletions, assignments):
         ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
         if ret[-1] != 0:
             logger.debug("  GetTableForEditingArray failed (ret=%s)", ret[-1])
-            return 0, 0
+            return ret[-1]
 
         table_version = ret[0]
         fields = list(ret[1]) if ret[1] else []
@@ -877,8 +906,7 @@ def bulk_delete_and_assign_loads(safe_model, deletions, assignments):
         table_data = list(ret[3]) if ret[3] else []
 
         if not fields:
-            logger.debug("  No fields in '%s' table", table_key)
-            return 0, 0
+            return -1
 
         num_fields = len(fields)
         name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
@@ -887,61 +915,32 @@ def bulk_delete_and_assign_loads(safe_model, deletions, assignments):
         val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value")
         csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
-        # Step 1: Filter out rows that match deletions
-        num_deleted = 0
-        if deletions and name_col is not None and pat_col is not None:
-            new_data = []
-            new_records = 0
-            for row in range(num_records):
-                start = row * num_fields
-                row_data = table_data[start:start + num_fields]
-                if len(row_data) < num_fields:
-                    continue
-                slab = row_data[name_col]
-                pat = row_data[pat_col]
-                if slab in deletions and pat in deletions[slab]:
-                    num_deleted += 1
-                    continue
-                new_data.extend(row_data)
-                new_records += 1
-            table_data = new_data
-            num_records = new_records
+        new_row = [""] * num_fields
+        if name_col is not None:
+            new_row[name_col] = slab_name
+        if pat_col is not None:
+            new_row[pat_col] = load["load_pattern"]
+        if dir_col is not None:
+            new_row[dir_col] = str(load["direction"])
+        if val_col is not None:
+            new_row[val_col] = str(load["value"])
+        if csys_col is not None:
+            new_row[csys_col] = load["csys"]
+        table_data.extend(new_row)
+        num_records += 1
 
-        # Step 2: Append new assignment rows
-        num_assigned = 0
-        for slab_name, load in assignments:
-            new_row = [""] * num_fields
-            if name_col is not None:
-                new_row[name_col] = slab_name
-            if pat_col is not None:
-                new_row[pat_col] = load["load_pattern"]
-            if dir_col is not None:
-                new_row[dir_col] = str(load["direction"])
-            if val_col is not None:
-                new_row[val_col] = str(load["value"])
-            if csys_col is not None:
-                new_row[csys_col] = load["csys"]
-            table_data.extend(new_row)
-            num_records += 1
-            num_assigned += 1
-
-        # Step 3: Single Set + Apply
         ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
         if retcode != 0:
             logger.debug("  SetTableForEditingArray failed (ret=%s)", retcode)
-            return 0, 0
+            return retcode
 
         ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
-        if retcode != 0:
-            logger.debug("  ApplyEditedTables failed (ret=%s)", retcode)
-            return 0, 0
-
-        return num_deleted, num_assigned
+        return retcode
     except Exception as e:
-        logger.debug("  Bulk delete/assign failed: %s", e)
-        return 0, 0
+        logger.debug("  Database table load assignment failed: %s", e)
+        return -1
 
 
 def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
@@ -969,14 +968,6 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
     loads_assigned = 0
     total = len(selected_areas)
     csv_rows = []
-
-    # --- Pass 1: Gather all operations (no SAFE writes yet) ---
-    # deletions: {safe_slab_name: set of pattern names}
-    # assignments: [(safe_slab_name, load_dict), ...]
-    # slab_results: [(area_name, label, story, safe_slab_name, loads), ...]
-    deletions = {}
-    assignments = []
-    slab_results = []
 
     for idx, area_name in enumerate(selected_areas):
         label, story = get_etabs_label(etabs_model, area_name, label_cache=label_cache)
@@ -1035,53 +1026,34 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
         logger.info("  Matched to SAFE slab: '%s'", safe_slab_name)
         matched += 1
 
-        # Gather existing loads for deletion
+        # Delete existing loads on SAFE slab before overwriting
         existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name, safe_load_cache=safe_load_cache)
         if existing_safe_loads:
-            unique_patterns = set(existing_safe_loads)
-            logger.info("  SAFE slab '%s' has existing loads: %s", safe_slab_name, sorted(unique_patterns))
-            deletions[safe_slab_name] = unique_patterns
+            unique_patterns = sorted(set(existing_safe_loads))
+            logger.info("  SAFE slab '%s' has existing loads: %s", safe_slab_name, unique_patterns)
+            deleted = delete_safe_slab_loads(safe_model, safe_slab_name, unique_patterns)
+            logger.info("  Deleted %d existing load pattern(s) from SAFE slab", deleted)
         else:
             logger.info("  SAFE slab '%s' has no existing loads", safe_slab_name)
 
-        # Ensure load patterns exist in SAFE (done here since it's cheap via COM)
+        # Ensure load patterns exist in SAFE
         for load in loads:
             ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns)
 
-        # Queue assignments
+        # Assign loads via COM (fast per-slab calls)
         for load in loads:
-            assignments.append((safe_slab_name, load))
-
-        slab_results.append((area_name, label, story, safe_slab_name, loads))
-
-        if progress_callback:
-            progress_callback(idx + 1, total)
-
-    # --- Pass 2: Bulk write to SAFE (single ApplyEditedTables) ---
-    if assignments:
-        logger.info("Writing %d load(s) to SAFE (%d deletions across %d slabs)...",
-                     len(assignments), sum(len(v) for v in deletions.values()), len(deletions))
-        num_deleted, num_assigned = bulk_delete_and_assign_loads(
-            safe_model, deletions, assignments)
-        logger.info("Bulk write complete: %d deleted, %d assigned", num_deleted, num_assigned)
-
-        if num_assigned > 0:
-            loads_assigned = num_assigned
-            status = "OK"
-        else:
-            status = "FAILED"
-            logger.error("Bulk write failed — 0 loads assigned")
-    else:
-        status = "No loads"
-
-    # Build CSV rows for matched slabs
-    for area_name, label, story, safe_slab_name, loads in slab_results:
-        for load in loads:
+            ret = assign_load_to_safe(safe_model, safe_slab_name, load)
+            if ret == 0:
+                loads_assigned += 1
+                logger.info("  Assigned: Pattern='%s', Value=%.4f -> OK",
+                            load["load_pattern"], load["value"])
+                status = "OK"
+            else:
+                logger.error("  FAILED: Pattern='%s', Value=%.4f (ret=%s)",
+                             load["load_pattern"], load["value"], ret)
+                status = f"FAILED (ret={ret})"
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
-            if status == "OK":
-                logger.info("  Assigned: '%s' -> '%s', Pattern='%s', Value=%.4f",
-                            area_name, safe_slab_name, load["load_pattern"], load["value"])
             csv_rows.append({
                 "ETABS_UniqueName": area_name,
                 "ETABS_Label": label,
@@ -1093,6 +1065,9 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
                 "SAFE_SlabName": safe_slab_name,
                 "Assignment_Status": status,
             })
+
+        if progress_callback:
+            progress_callback(idx + 1, total)
 
     safe_model.View.RefreshView(0, False)
 

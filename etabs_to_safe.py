@@ -75,8 +75,10 @@ def get_selected_area_names(etabs_model):
     return area_names
 
 
-def get_etabs_label(etabs_model, area_name):
+def get_etabs_label(etabs_model, area_name, label_cache=None):
     """Get the label and story for an area object in ETABS."""
+    if label_cache is not None and area_name in label_cache:
+        return label_cache[area_name]
     ret = etabs_model.AreaObj.GetLabelFromName(area_name, "", "")
     # ret: (Label, Story, retcode)
     retcode = ret[-1]
@@ -86,6 +88,69 @@ def get_etabs_label(etabs_model, area_name):
     label = ret[0]
     story = ret[1]
     return label, story
+
+
+def build_label_cache(etabs_model):
+    """Pre-read ETABS area object labels from database tables. Returns dict: unique_name -> (label, story)."""
+    cache = {}
+    try:
+        db = etabs_model.DatabaseTables
+        for table_name in [
+            "Objects and Elements - Areas",
+            "Area Object Connectivity",
+            "Objects - Area Objects",
+            "Area Section Assignments",
+        ]:
+            tdata = _read_table(db, table_name)
+            if tdata is None:
+                continue
+            fields, num_fields, num_records, table_data = tdata
+            name_col = _find_column(fields, "UniqueName", "Unique Name")
+            label_col = _find_column(fields, "Label")
+            story_col = _find_column(fields, "Story", "Level")
+            if name_col is None or label_col is None:
+                continue
+            for row in range(num_records):
+                start = row * num_fields
+                row_data = table_data[start:start + num_fields]
+                if len(row_data) < num_fields:
+                    continue
+                uname = row_data[name_col]
+                label = row_data[label_col]
+                story = row_data[story_col] if story_col is not None else ""
+                cache[uname] = (label, story)
+            print(f"Cached {len(cache)} label(s) from '{table_name}'")
+            break
+    except Exception:
+        pass
+    return cache
+
+
+def build_safe_load_cache(safe_model):
+    """Pre-read SAFE existing load assignments. Returns dict: slab_name -> [pattern_names]."""
+    cache = {}
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+        ret = db.GetTableForDisplayArray(table_key, [], "", 0, [], 0, [])
+        if ret[-1] == 0 and ret[4]:
+            fields = list(ret[2]) if ret[2] else []
+            num_records = ret[3]
+            table_data = list(ret[4])
+            num_fields = len(fields)
+            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+            pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+            if name_col is not None and pat_col is not None:
+                for row in range(num_records):
+                    start = row * num_fields
+                    if start + num_fields <= len(table_data):
+                        slab = table_data[start + name_col]
+                        pat = table_data[start + pat_col]
+                        cache.setdefault(slab, []).append(pat)
+                print(f"Cached existing SAFE loads: {len(cache)} slab(s) with loads")
+    except Exception:
+        pass
+    return cache
 
 
 def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
@@ -616,9 +681,12 @@ def get_existing_load_patterns(safe_model):
     return set(names) if names else set()
 
 
-def get_safe_slab_loads(safe_model, slab_name):
+def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
     """Get existing uniform loads on a SAFE slab. Returns list of load pattern names."""
-    # Try COM API first
+    if safe_load_cache is not None:
+        return safe_load_cache.get(slab_name, [])
+
+    # Fallback: COM API
     try:
         ret = safe_model.AreaObj.GetLoadUniform(slab_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
@@ -837,8 +905,14 @@ def main():
     print(f"Existing load patterns in SAFE: {existing_patterns}")
     print()
 
-    # Pre-cache database table loads (avoids re-reading tables per slab)
+    # Pre-cache everything from database tables (avoids per-slab COM calls)
+    print("Building caches from database tables...")
     table_cache = build_table_load_cache(etabs_model)
+    label_cache = build_label_cache(etabs_model)
+    safe_load_cache = build_safe_load_cache(safe_model)
+    print(f"Caches ready: {sum(len(v) for v in table_cache.values()) if table_cache else 0} ETABS loads, "
+          f"{len(label_cache)} labels, {len(safe_load_cache)} SAFE load entries")
+    print()
 
     # Process each selected slab
     matched = 0
@@ -846,7 +920,7 @@ def main():
     loads_assigned = 0
 
     for area_name in selected_areas:
-        label, story = get_etabs_label(etabs_model, area_name)
+        label, story = get_etabs_label(etabs_model, area_name, label_cache=label_cache)
         print(f"ETABS slab: '{area_name}' (Label: '{label}', Story: '{story}')")
 
         # Get loads from ETABS
@@ -876,7 +950,7 @@ def main():
         matched += 1
 
         # Check for existing loads on SAFE slab and delete them before overwriting
-        existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name)
+        existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name, safe_load_cache=safe_load_cache)
         if existing_safe_loads:
             unique_patterns = sorted(set(existing_safe_loads))
             print(f"  Existing loads in SAFE: {unique_patterns}")

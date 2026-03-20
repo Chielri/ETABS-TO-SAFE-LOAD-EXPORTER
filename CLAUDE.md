@@ -1,11 +1,20 @@
 # CLAUDE.md
 
+## IMPORTANT: Read API Reference Files First
+**Before making ANY code changes**, you MUST read the following API reference files. ETABS and SAFE API documentation is extremely scarce online and not reliably in training data. These skill files are the authoritative source for correct API usage:
+- `etabs-api.skill` — ETABS COM API reference (methods, parameters, return values, table names)
+- `safe-api.skill` — SAFE COM API reference (methods, parameters, return values, table names)
+
+**Always consult these files** when working with COM API calls, database table names, method signatures, parameter types, or return value structures. Do not guess or rely on training data for ETABS/SAFE API details.
+
 ## Project Overview
 ETABS to SAFE Shell Uniform Load Exporter — a Python tool that transfers shell uniform loads from CSI ETABS to CSI SAFE via their COM APIs.
 
 ## Repository Structure
 - `etabs_to_safe.py` — CLI script (no GUI, prints to stdout)
 - `etabs_to_safe_gui.py` — Tkinter GUI with logging, debug toggle, progress bar, log save
+- `etabs-api.skill` — ETABS COM API reference documentation (MUST READ before coding)
+- `safe-api.skill` — SAFE COM API reference documentation (MUST READ before coding)
 - `requirements.txt` — Python dependencies
 - `.github/workflows/build.yml` — GitHub Actions workflow to build Windows .exe and commit it to repo
 

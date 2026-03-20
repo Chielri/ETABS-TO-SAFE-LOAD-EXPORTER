@@ -12,9 +12,7 @@ import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext
-import sys
 import traceback
-from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Core logic (identical to etabs_to_safe.py but uses logging instead of print)
@@ -396,7 +394,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
             loads.append(load)
             logger.debug("  Direct table row match: %s", load)
 
-        loads = [ld for ld in loads if not str(ld["load_pattern"]).startswith("~")]
+        loads = _filter_internal_patterns(loads)
         if loads:
             logger.info("  Found %d load(s) via direct table '%s'", len(loads), table_name)
             return loads
@@ -494,14 +492,11 @@ def build_table_load_cache(etabs_model):
     cache = {}
     db = etabs_model.DatabaseTables
 
-    # Discover ALL candidate table names (not just load-related ones for debug)
     all_tables = []
-    all_available = []
     try:
         ret = db.GetAvailableTables(0, [], [], [])
         if ret[-1] == 0 and ret[1]:
-            all_available = list(ret[1])
-            for t in all_available:
+            for t in ret[1]:
                 tl = t.lower()
                 if "uniform" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
@@ -509,7 +504,6 @@ def build_table_load_cache(etabs_model):
                     all_tables.append(t)
                 elif "load set" in tl:
                     all_tables.append(t)
-            logger.debug("  All available tables (%d): %s", len(all_available), all_available)
             logger.info("  Discovered %d candidate load tables: %s", len(all_tables), all_tables)
     except Exception as e:
         logger.warning("  GetAvailableTables error: %s", e)
@@ -558,13 +552,7 @@ def build_table_load_cache(etabs_model):
 
         if table_count > 0:
             direct_count += table_count
-            logger.info("  Direct table '%s': cached %d load(s) for %d slab(s)",
-                        table_name, table_count, len(set(
-                            table_data[row * num_fields + name_col]
-                            for row in range(num_records)
-                            if row * num_fields + num_fields <= len(table_data)
-                            and not str(table_data[row * num_fields + pat_col]).startswith("~")
-                        )))
+            logger.info("  Direct table '%s': cached %d load(s)", table_name, table_count)
 
     if direct_count > 0:
         logger.info("  Step 1 total: %d direct load(s) for %d slab(s)",
@@ -1236,29 +1224,15 @@ class App(tk.Tk):
         self.text_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                                           datefmt="%H:%M:%S"))
         logger.addHandler(self.text_handler)
-
-        # Always write a debug log file (captures everything regardless of GUI level)
-        self._debug_log_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        )
-        self.file_handler = logging.FileHandler(self._debug_log_path, encoding="utf-8")
-        self.file_handler.setLevel(logging.DEBUG)
-        self.file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        ))
-        logger.addHandler(self.file_handler)
         logger.setLevel(logging.DEBUG)
 
         # GUI text handler defaults to INFO (user toggles with Debug checkbox)
         self.text_handler.setLevel(logging.INFO)
-        logger.info("Debug log file: %s", self._debug_log_path)
 
     def _toggle_debug(self):
         level = logging.DEBUG if self.debug_var.get() else logging.INFO
         self.text_handler.setLevel(level)
-        logger.info("GUI log level set to %s (file log always DEBUG)", logging.getLevelName(level))
+        logger.info("Log level set to %s", logging.getLevelName(level))
 
     # -- Actions -------------------------------------------------------------
 
@@ -1404,8 +1378,6 @@ class App(tk.Tk):
         csv_path = ""
         if csv_rows and self.csv_var.get():
             csv_path = self._save_csv(csv_rows)
-
-        logger.info("Debug log saved to: %s", self._debug_log_path)
 
         status_msg = (
             f"Done! Matched: {summary['matched']}, "

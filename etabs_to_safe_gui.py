@@ -606,6 +606,116 @@ def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
     return existing_patterns
 
 
+def get_safe_slab_loads(safe_model, slab_name):
+    """Get existing uniform loads on a SAFE slab. Returns list of load pattern names."""
+    # Try COM API first
+    try:
+        ret = safe_model.AreaObj.GetLoadUniform(slab_name, 0, [], [], [], [], [], 0)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            patterns = []
+            for i in range(number_items):
+                patterns.append(str(ret[2][i]))
+            return patterns
+    except Exception as e:
+        logger.debug("  GetLoadUniform on SAFE slab '%s': %s", slab_name, e)
+
+    # Fallback: database tables
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+        ret = db.GetTableForDisplayArray(table_key, [], "", 0, [], 0, [])
+        if ret[-1] == 0 and ret[4]:
+            fields = list(ret[2]) if ret[2] else []
+            num_records = ret[3]
+            table_data = list(ret[4])
+            num_fields = len(fields)
+            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+            pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+            if name_col is not None and pat_col is not None:
+                patterns = []
+                for row in range(num_records):
+                    start = row * num_fields
+                    if start + num_fields <= len(table_data):
+                        if table_data[start + name_col] == slab_name:
+                            patterns.append(table_data[start + pat_col])
+                return patterns
+    except Exception as e:
+        logger.debug("  SAFE table read for existing loads failed: %s", e)
+
+    return []
+
+
+def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
+    """Delete existing uniform loads from a SAFE slab for the given load patterns."""
+    deleted = 0
+    # Try COM API first
+    for pat in load_patterns:
+        try:
+            ret = safe_model.AreaObj.DeleteLoadUniform(slab_name, pat)
+            retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+            if retcode == 0:
+                deleted += 1
+                continue
+        except Exception:
+            pass
+        # Fallback: database tables
+        if _delete_load_via_tables(safe_model, slab_name, pat) == 0:
+            deleted += 1
+    return deleted
+
+
+def _delete_load_via_tables(safe_model, slab_name, load_pattern):
+    """Delete a uniform load from SAFE via database tables API."""
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+
+        ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return ret[-1]
+
+        table_version = ret[0]
+        fields = list(ret[1]) if ret[1] else []
+        num_records = ret[2]
+        table_data = list(ret[3]) if ret[3] else []
+
+        if not fields or num_records == 0:
+            return -1
+
+        num_fields = len(fields)
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+        if name_col is None or pat_col is None:
+            return -1
+
+        # Rebuild table data excluding rows matching slab_name + load_pattern
+        new_data = []
+        new_records = 0
+        for row in range(num_records):
+            start = row * num_fields
+            row_data = table_data[start:start + num_fields]
+            if len(row_data) < num_fields:
+                continue
+            if row_data[name_col] == slab_name and row_data[pat_col] == load_pattern:
+                continue  # Skip this row (delete it)
+            new_data.extend(row_data)
+            new_records += 1
+
+        ret = db.SetTableForEditingArray(table_key, table_version, fields, new_records, new_data)
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode != 0:
+            return retcode
+
+        ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        return retcode
+    except Exception as e:
+        logger.debug("  Database table load deletion failed: %s", e)
+        return -1
+
+
 def assign_load_to_safe(safe_model, slab_name, load):
     # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
     try:
@@ -760,6 +870,16 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
 
         logger.info("  Matched to SAFE slab: '%s'", safe_slab_name)
         matched += 1
+
+        # Check for existing loads on SAFE slab and delete them before overwriting
+        existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name)
+        if existing_safe_loads:
+            unique_patterns = sorted(set(existing_safe_loads))
+            logger.info("  SAFE slab '%s' has existing loads: %s", safe_slab_name, unique_patterns)
+            deleted = delete_safe_slab_loads(safe_model, safe_slab_name, unique_patterns)
+            logger.info("  Deleted %d existing load pattern(s) from SAFE slab", deleted)
+        else:
+            logger.info("  SAFE slab '%s' has no existing loads", safe_slab_name)
 
         for load in loads:
             existing_patterns = ensure_load_pattern_exists(

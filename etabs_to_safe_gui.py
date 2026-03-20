@@ -5,6 +5,7 @@ Tkinter GUI with logging panel, debug toggle, and export functionality.
 """
 
 import csv
+from datetime import datetime
 import logging
 import os
 import subprocess
@@ -113,9 +114,17 @@ def get_etabs_label(etabs_model, area_name):
 
 
 def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
-    """Get shell uniform loads — tries direct API, element-level API, then database tables."""
-    # 1) Try the standard direct API call
-    logger.info("  Check 1/3: AreaObj.GetLoadUniform (direct API)...")
+    """Get shell uniform loads — tries table cache first (fast), then COM API fallbacks."""
+    # 1) Table cache (instant lookup — preferred when available)
+    if table_cache is not None:
+        loads = table_cache.get(area_name, [])
+        if loads:
+            logger.debug("  Cache hit: %d load(s) for '%s'", len(loads), area_name)
+            return loads
+        logger.debug("  Cache miss for '%s', falling back to COM API", area_name)
+
+    # 2) Try the standard direct API call
+    logger.info("  Fallback 1/2: AreaObj.GetLoadUniform (direct API)...")
     try:
         ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         logger.debug("  GetLoadUniform raw return: %s", ret)
@@ -134,15 +143,15 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                     "csys": str(ret[3][i]),
                 })
             if loads:
-                logger.info("  Check 1/3: Found %d load(s) via direct API.", len(loads))
+                logger.info("  Fallback 1/2: Found %d load(s) via direct API.", len(loads))
                 return loads
-        logger.info("  Check 1/3: No loads found (retcode=%s, items=%s).", retcode, number_items)
+        logger.debug("  Fallback 1/2: No loads (retcode=%s, items=%s).", retcode, number_items)
     except Exception as e:
-        logger.info("  Check 1/3: Not available (%s).", e)
+        logger.debug("  Fallback 1/2: Not available (%s).", e)
 
-    # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
+    # 3) Try element-level query (cAreaElm) — may see loads the object-level misses
     #    NOTE: Returns one entry per mesh element, so we must deduplicate.
-    logger.info("  Check 2/3: AreaElm.GetLoadUniform (element-level API)...")
+    logger.info("  Fallback 2/2: AreaElm.GetLoadUniform (element-level API)...")
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         logger.debug("  AreaElm.GetLoadUniform raw return: %s", ret)
@@ -168,28 +177,23 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                         "csys": csys,
                     })
             if loads:
-                logger.info("  Check 2/3: Found %d load(s) via element-level API.", len(loads))
+                logger.info("  Fallback 2/2: Found %d load(s) via element-level API.", len(loads))
                 return loads
-        logger.info("  Check 2/3: No loads found (retcode=%s, items=%s).", retcode, number_items)
+        logger.debug("  Fallback 2/2: No loads (retcode=%s, items=%s).", retcode, number_items)
     except Exception as e:
-        logger.info("  Check 2/3: Not available (%s).", e)
+        logger.debug("  Fallback 2/2: Not available (%s).", e)
 
-    # 3) Database tables (catches loads assigned via Load Sets)
-    logger.info("  Check 3/3: Database tables (cached)...")
-    if table_cache is not None:
-        loads = table_cache.get(area_name, [])
+    # 4) Last resort: read database tables individually (no cache available)
+    if table_cache is None:
+        logger.info("  Last resort: Reading database tables for '%s'...", area_name)
+        loads = _get_uniform_loads_from_tables(etabs_model, area_name)
         if loads:
-            logger.info("  Check 3/3: Found %d load(s) from table cache.", len(loads))
+            logger.info("  Found %d load(s) from database tables.", len(loads))
         else:
-            logger.info("  Check 3/3: No loads found in table cache for '%s'.", area_name)
+            logger.debug("  No loads found in database tables.")
         return loads
-    logger.info("  Check 3/3: Reading database tables for '%s'...", area_name)
-    loads = _get_uniform_loads_from_tables(etabs_model, area_name)
-    if loads:
-        logger.info("  Check 3/3: Found %d load(s) from database tables.", len(loads))
-    else:
-        logger.info("  Check 3/3: No loads found in database tables.")
-    return loads
+
+    return []
 
 
 # Direction string-to-int mapping for database table values

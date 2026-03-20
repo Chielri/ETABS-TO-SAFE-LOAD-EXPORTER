@@ -89,14 +89,17 @@ def get_etabs_label(etabs_model, area_name):
 
 
 def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
-    """Get all shell uniform loads assigned to an area object in ETABS.
+    """Get shell uniform loads — tries table cache first (fast), then COM API fallbacks."""
+    # 1) Table cache (instant lookup — preferred when available)
+    if table_cache is not None:
+        loads = table_cache.get(area_name, [])
+        if loads:
+            print(f"  Cache hit: {len(loads)} load(s) for '{area_name}'")
+            return loads
+        print(f"  Cache miss for '{area_name}', falling back to COM API")
 
-    Tries direct API, element-level API, then database tables.
-    If table_cache is provided, uses pre-loaded table data instead of re-reading.
-    Returns a list of dicts with load details.
-    """
-    # 1) Try the standard direct API call
-    print(f"  Check 1/3: AreaObj.GetLoadUniform (direct API)...")
+    # 2) Try the standard direct API call
+    print(f"  Fallback 1/2: AreaObj.GetLoadUniform (direct API)...")
     try:
         ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
@@ -114,15 +117,14 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                     "csys": str(ret[3][i]),
                 })
             if loads:
-                print(f"  Check 1/3: Found {len(loads)} load(s) via direct API.")
+                print(f"  Fallback 1/2: Found {len(loads)} load(s) via direct API.")
                 return loads
-        print(f"  Check 1/3: No loads found (retcode={retcode}, items={number_items}).")
+        print(f"  Fallback 1/2: No loads (retcode={retcode}, items={number_items}).")
     except Exception as e:
-        print(f"  Check 1/3: Not available ({e}).")
+        print(f"  Fallback 1/2: Not available ({e}).")
 
-    # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
-    #    NOTE: Returns one entry per mesh element, so we must deduplicate.
-    print(f"  Check 2/3: AreaElm.GetLoadUniform (element-level API)...")
+    # 3) Try element-level query (cAreaElm) — may see loads the object-level misses
+    print(f"  Fallback 2/2: AreaElm.GetLoadUniform (element-level API)...")
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
@@ -147,28 +149,23 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                         "csys": csys,
                     })
             if loads:
-                print(f"  Check 2/3: Found {len(loads)} load(s) via element-level API.")
+                print(f"  Fallback 2/2: Found {len(loads)} load(s) via element-level API.")
                 return loads
-        print(f"  Check 2/3: No loads found (retcode={retcode}, items={number_items}).")
+        print(f"  Fallback 2/2: No loads (retcode={retcode}, items={number_items}).")
     except Exception as e:
-        print(f"  Check 2/3: Not available ({e}).")
+        print(f"  Fallback 2/2: Not available ({e}).")
 
-    # 3) Database tables (catches loads assigned via Load Sets)
-    print(f"  Check 3/3: Database tables (cached)...")
-    if table_cache is not None:
-        loads = table_cache.get(area_name, [])
+    # 4) Last resort: read database tables individually (no cache available)
+    if table_cache is None:
+        print(f"  Last resort: Reading database tables for '{area_name}'...")
+        loads = _get_uniform_loads_from_tables(etabs_model, area_name)
         if loads:
-            print(f"  Check 3/3: Found {len(loads)} load(s) from table cache.")
+            print(f"  Found {len(loads)} load(s) from database tables.")
         else:
-            print(f"  Check 3/3: No loads found in table cache for '{area_name}'.")
+            print(f"  No loads found in database tables.")
         return loads
-    print(f"  Check 3/3: Reading database tables for '{area_name}'...")
-    loads = _get_uniform_loads_from_tables(etabs_model, area_name)
-    if loads:
-        print(f"  Check 3/3: Found {len(loads)} load(s) from database tables.")
-    else:
-        print(f"  Check 3/3: No loads found in database tables.")
-    return loads
+
+    return []
 
 
 # Direction string-to-int mapping for database table values

@@ -21,32 +21,9 @@ ETABS to SAFE Shell Uniform Load Exporter — a Python tool that transfers shell
 ## Key Concepts
 - Both ETABS and SAFE expose COM APIs via `comtypes` on Windows
 - ETABS connection: `ETABSv1.Helper` → `CSI.ETABS.API.ETABSObject` → `SapModel`
-- SAFE connection: `SAFEv1.Helper` → `CSI.SAFE.API.ETABSObject` → `SapModel`
-  - **CRITICAL**: SAFE reuses ETABS API infrastructure. The ProgID is `ETABSObject`, NOT `SAFEObject`.
-- ETABS exposes rich COM interfaces: `cAreaObj`, `cAreaElm`, `cLoadPatterns`, `cSelect`, `cDatabaseTables`, etc.
-- SAFE has exactly 14 interfaces (per CHM): `cAnalysisResults`, `cAnalysisResultsSetup`, `cAnalyze`, `cDatabaseTables`, `cDesignCompositeBeam`, `cDesignConcrete`, `cDesignConcreteSlab`, `cDesignSteel`, `cFile`, `cHelper`, `cOAPI`, `cSapModel`, `cSelect`, `cView`
-  - **SAFE does NOT expose `cAreaObj`, `cLoadPatterns`, `cAreaElm`** — these are ETABS-only
-  - All SAFE model manipulation (loads, geometry, properties) goes through `cDatabaseTables`
-  - Key table: `"Area Load Assignments - Uniform"` for reading/writing uniform area loads
-- Slab matching: ETABS slab label (`GetLabelFromName`) → SAFE slab unique name (via database tables)
-- Shell uniform loads: `AreaObj.GetLoadUniform` (read from ETABS), database tables (write to SAFE)
-
-## API Reference
-- Authoritative source: `CSI API ETABS v1.chm` and `CSI API SAFE v1.chm` (extract with `extract_chmLib`)
-- Supplementary: `etabs-api.skill` and `safe-api.skill` (ZIP archives, extract with `unzip`)
-- COM return values (comtypes): `[OutParam1, OutParam2, ..., ret]` — ref params become outputs, return code is LAST
-- SAFE database table data is a flat 1D string array, row-by-row (N fields × M records)
-- All API methods return int: 0 = success, nonzero = failure
-- Key ETABS signatures (verified from CHM):
-  - `cAreaObj.GetLoadUniform(Name, ref NumberItems, ref AreaName[], ref LoadPat[], ref CSys[], ref Dir[], ref Value[], ItemType)`
-  - `cAreaObj.GetLabelFromName(Name, ref Label, ref Story)`
-  - `cSelect.GetSelected(ref NumberItems, ref ObjectType[], ref ObjectName[])`
-  - `cLoadPatterns.Add(Name, LoadPatternType, SelfWTMultiplier, AddToLoadCombination)`
-- Key SAFE signatures (verified from CHM):
-  - `cDatabaseTables.GetTableForDisplayArray(TableKey, ref FieldKeyList[], GroupName, ref TableVersion, ref FieldsKeysIncluded[], ref NumberRecords, ref TableData[])`
-  - `cDatabaseTables.GetTableForEditingArray(TableKey, GroupName, ref TableVersion, ref FieldsKeysIncluded[], ref NumberRecords, ref TableData[])`
-  - `cDatabaseTables.SetTableForEditingArray(TableKey, ref TableVersion, ref FieldsKeysIncluded[], NumberRecords, ref TableData[])`
-  - `cDatabaseTables.ApplyEditedTables(FillImportLog, ref NumFatalErrors, ref NumErrorMsgs, ref NumWarnMsgs, ref NumInfoMsgs, ref ImportLog)`
+- SAFE connection: `SAFEv1.Helper` → `CSI.SAFE.API.SAFEObject` → `SapModel`
+- Slab matching: ETABS slab label (`GetLabelFromName`) → SAFE slab unique name (`GetNameList`)
+- Shell uniform loads: `AreaObj.GetLoadUniform` (read from ETABS), `AreaObj.SetLoadUniform` (write to SAFE)
 
 ## Caching Strategy
 All read-heavy data is pre-cached from database tables before the per-slab export loop:

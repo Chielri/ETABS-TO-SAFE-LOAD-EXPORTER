@@ -208,9 +208,9 @@ Understanding how the tool matches slabs is important for getting correct result
 1. Connects to ETABS via `ETABSv1.Helper` COM object
 2. Connects to SAFE via `SAFEv1.Helper` COM object
 3. Gets selected area objects (type 5) from ETABS
-4. For each slab, reads uniform loads (`AreaObj.GetLoadUniform`)
-5. Gets the ETABS slab label via `GetLabelFromName`
-6. Looks up the matching slab in SAFE by unique name
+4. **Caches all data upfront** from database tables — ETABS loads, ETABS labels/stories, and SAFE existing loads — so the per-slab loop uses fast dictionary lookups instead of repeated COM calls
+5. For each slab, looks up uniform loads and label from cache
+6. Matches the ETABS slab label to the corresponding SAFE slab name
 7. Creates any missing load patterns in SAFE
 8. Assigns loads via `AreaObj.SetLoadUniform`
 
@@ -223,7 +223,7 @@ pyinstaller --onefile --windowed --name ETABStoSAFE etabs_to_safe_gui.py
 
 The `.exe` will be in the `dist/` folder.
 
-A GitHub Actions workflow is included that builds and uploads the executable automatically on each release.
+A GitHub Actions workflow is included that automatically builds the executable on push to `main` or manual dispatch, commits the updated `ETABStoSAFE.exe` back to the repo, and attaches it to GitHub releases.
 
 ## CSV Report Columns
 

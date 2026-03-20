@@ -607,21 +607,61 @@ def get_safe_area_names(safe_model):
     """Get all area object names in SAFE and return as a set for fast lookup.
 
     SAFE does not expose AreaObj — uses database tables exclusively.
+    Tries multiple candidate table names, then falls back to dynamic discovery.
     """
+    db = safe_model.DatabaseTables
+
+    # Static candidates — try these first (most likely names)
+    candidate_tables = [
+        "Objects and Elements - Areas",
+        "Area Object Connectivity",
+        "Objects - Area Objects",
+        "Area Section Assignments",
+        "Slab Object Connectivity",
+    ]
+
+    def _extract_names(tdata):
+        fields, num_fields, num_records, table_data = tdata
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+        if name_col is None:
+            return None
+        name_set = set()
+        for row in range(num_records):
+            start = row * num_fields
+            if start + name_col < len(table_data):
+                name_set.add(table_data[start + name_col])
+        return name_set
+
+    # Try static candidates
+    for table_name in candidate_tables:
+        try:
+            tdata = _read_table(db, table_name)
+            if tdata is not None:
+                name_set = _extract_names(tdata)
+                if name_set is not None:
+                    print(f"Found {len(name_set)} area object(s) in SAFE from '{table_name}'.")
+                    return name_set
+        except Exception:
+            pass
+
+    # Dynamic discovery — search for any table with area/slab object info
     try:
-        db = safe_model.DatabaseTables
-        tdata = _read_table(db, "Objects and Elements - Areas")
-        if tdata is not None:
-            fields, num_fields, num_records, table_data = tdata
-            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
-            if name_col is not None:
-                name_set = set()
-                for row in range(num_records):
-                    start = row * num_fields
-                    if start + name_col < len(table_data):
-                        name_set.add(table_data[start + name_col])
-                print(f"Found {len(name_set)} area object(s) in SAFE.")
-                return name_set
+        ret = db.GetAvailableTables(0, [], [], [])
+        if ret[-1] == 0 and ret[1]:
+            for t in ret[1]:
+                tl = t.lower()
+                if ("area" in tl or "slab" in tl) and ("object" in tl or "element" in tl or "connectivity" in tl):
+                    if t in candidate_tables:
+                        continue
+                    try:
+                        tdata = _read_table(db, t)
+                        if tdata is not None:
+                            name_set = _extract_names(tdata)
+                            if name_set is not None:
+                                print(f"Found {len(name_set)} area object(s) in SAFE from '{t}'.")
+                                return name_set
+                    except Exception:
+                        pass
     except Exception:
         pass
 

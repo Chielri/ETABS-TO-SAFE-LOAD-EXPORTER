@@ -686,25 +686,67 @@ def get_safe_area_names(safe_model):
     """Get all area object names in SAFE via database tables.
 
     SAFE does not expose AreaObj — uses database tables exclusively.
+    Tries multiple candidate table names, then falls back to dynamic discovery.
     """
-    try:
-        db = safe_model.DatabaseTables
-        tdata = _read_table(db, "Objects and Elements - Areas")
-        if tdata is not None:
-            fields, num_fields, num_records, table_data = tdata
-            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
-            if name_col is not None:
-                name_set = set()
-                for row in range(num_records):
-                    start = row * num_fields
-                    if start + name_col < len(table_data):
-                        name_set.add(table_data[start + name_col])
-                logger.info("Found %d area object(s) in SAFE.", len(name_set))
-                return name_set
-    except Exception as e:
-        logger.debug("SAFE database table read failed: %s", e)
+    db = safe_model.DatabaseTables
 
-    logger.warning("Failed to get area names from SAFE.")
+    # Static candidates — try these first (most likely names)
+    candidate_tables = [
+        "Objects and Elements - Areas",
+        "Area Object Connectivity",
+        "Objects - Area Objects",
+        "Area Section Assignments",
+        "Slab Object Connectivity",
+    ]
+
+    def _extract_names(tdata):
+        fields, num_fields, num_records, table_data = tdata
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+        if name_col is None:
+            logger.debug("  No name column found in fields: %s", fields)
+            return None
+        name_set = set()
+        for row in range(num_records):
+            start = row * num_fields
+            if start + name_col < len(table_data):
+                name_set.add(table_data[start + name_col])
+        return name_set
+
+    # Try static candidates
+    for table_name in candidate_tables:
+        try:
+            tdata = _read_table(db, table_name)
+            if tdata is not None:
+                name_set = _extract_names(tdata)
+                if name_set is not None:
+                    logger.info("Found %d area object(s) in SAFE from '%s'.", len(name_set), table_name)
+                    return name_set
+        except Exception as e:
+            logger.debug("  Table '%s' failed: %s", table_name, e)
+
+    # Dynamic discovery — search for any table with area/slab object info
+    try:
+        ret = db.GetAvailableTables(0, [], [], [])
+        if ret[-1] == 0 and ret[1]:
+            for t in ret[1]:
+                tl = t.lower()
+                if ("area" in tl or "slab" in tl) and ("object" in tl or "element" in tl or "connectivity" in tl):
+                    if t in candidate_tables:
+                        continue  # Already tried
+                    logger.debug("  Trying discovered table: '%s'", t)
+                    try:
+                        tdata = _read_table(db, t)
+                        if tdata is not None:
+                            name_set = _extract_names(tdata)
+                            if name_set is not None:
+                                logger.info("Found %d area object(s) in SAFE from '%s'.", len(name_set), t)
+                                return name_set
+                    except Exception as e:
+                        logger.debug("  Discovered table '%s' failed: %s", t, e)
+    except Exception as e:
+        logger.debug("  GetAvailableTables error: %s", e)
+
+    logger.warning("Failed to get area names from SAFE. No matching table found.")
     return set()
 
 

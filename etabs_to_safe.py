@@ -819,11 +819,17 @@ def assign_load_to_safe(safe_model, slab_name, load):
     SAFE does not expose AreaObj.SetLoadUniform — uses database tables exclusively.
     Returns 0 on success, non-zero on failure.
     """
-    return _assign_load_via_tables(safe_model, slab_name, load)
+    return assign_loads_batch_to_safe(safe_model, slab_name, [load])
 
 
-def _assign_load_via_tables(safe_model, slab_name, load):
-    """Assign a uniform load to SAFE via database tables API."""
+def assign_loads_batch_to_safe(safe_model, slab_name, loads):
+    """Assign multiple shell uniform loads to a slab in SAFE in one table operation.
+
+    Batches all loads into a single GetTable/SetTable/Apply cycle to avoid N+1.
+    Returns 0 on success, non-zero on failure.
+    """
+    if not loads:
+        return 0
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
@@ -848,20 +854,20 @@ def _assign_load_via_tables(safe_model, slab_name, load):
         val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value")
         csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
-        new_row = [""] * num_fields
-        if name_col is not None:
-            new_row[name_col] = slab_name
-        if pat_col is not None:
-            new_row[pat_col] = load["load_pattern"]
-        if dir_col is not None:
-            new_row[dir_col] = str(load["direction"])
-        if val_col is not None:
-            new_row[val_col] = str(load["value"])
-        if csys_col is not None:
-            new_row[csys_col] = load["csys"]
-
-        num_records += 1
-        table_data.extend(new_row)
+        for load in loads:
+            new_row = [""] * num_fields
+            if name_col is not None:
+                new_row[name_col] = slab_name
+            if pat_col is not None:
+                new_row[pat_col] = load["load_pattern"]
+            if dir_col is not None:
+                new_row[dir_col] = str(load["direction"])
+            if val_col is not None:
+                new_row[val_col] = str(load["value"])
+            if csys_col is not None:
+                new_row[csys_col] = load["csys"]
+            table_data.extend(new_row)
+            num_records += 1
 
         ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
@@ -966,19 +972,22 @@ def main():
         else:
             print(f"  No existing loads on SAFE slab (clean)")
 
-        # Ensure load patterns exist in SAFE and assign loads
+        # Ensure load patterns exist in SAFE
         for load in loads:
             ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns
             )
-            ret = assign_load_to_safe(safe_model, safe_slab_name, load)
-            if ret == 0:
-                loads_assigned += 1
+
+        # Assign all loads in one batched table operation
+        ret = assign_loads_batch_to_safe(safe_model, safe_slab_name, loads)
+        if ret == 0:
+            loads_assigned += len(loads)
+            for load in loads:
                 print(f"  Assigned: Pattern='{load['load_pattern']}', "
                       f"Value={load['value']:.4f} -> OK")
-            else:
-                print(f"  FAILED to assign: Pattern='{load['load_pattern']}' "
-                      f"(ret={ret})")
+        else:
+            print(f"  FAILED to assign {len(loads)} load(s) to '{safe_slab_name}' "
+                  f"(ret={ret})")
 
     # Refresh SAFE view
     safe_model.View.RefreshView(0, False)

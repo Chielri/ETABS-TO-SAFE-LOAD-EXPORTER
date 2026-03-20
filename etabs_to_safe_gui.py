@@ -901,16 +901,21 @@ def assign_load_to_safe(safe_model, slab_name, load):
     SAFE does not expose AreaObj.SetLoadUniform — uses database tables exclusively.
     Returns 0 on success, non-zero on failure.
     """
-    return _assign_load_via_tables(safe_model, slab_name, load)
+    return assign_loads_batch_to_safe(safe_model, slab_name, [load])
 
 
-def _assign_load_via_tables(safe_model, slab_name, load):
-    """Assign a uniform load to SAFE via database tables API."""
+def assign_loads_batch_to_safe(safe_model, slab_name, loads):
+    """Assign multiple shell uniform loads to a slab in SAFE in one table operation.
+
+    Batches all loads into a single GetTable/SetTable/Apply cycle to avoid N+1.
+    Returns 0 on success, non-zero on failure.
+    """
+    if not loads:
+        return 0
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
 
-        # Get current table structure
         ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
         if ret[-1] != 0:
             logger.debug("  GetTableForEditingArray failed (ret=%s)", ret[-1])
@@ -933,26 +938,23 @@ def _assign_load_via_tables(safe_model, slab_name, load):
         val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value")
         csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
-        new_row = [""] * num_fields
-        if name_col is not None:
-            new_row[name_col] = slab_name
-        if pat_col is not None:
-            new_row[pat_col] = load["load_pattern"]
-        if dir_col is not None:
-            new_row[dir_col] = str(load["direction"])
-        if val_col is not None:
-            new_row[val_col] = str(load["value"])
-        if csys_col is not None:
-            new_row[csys_col] = load["csys"]
-
-        num_records += 1
-        table_data.extend(new_row)
+        for load in loads:
+            new_row = [""] * num_fields
+            if name_col is not None:
+                new_row[name_col] = slab_name
+            if pat_col is not None:
+                new_row[pat_col] = load["load_pattern"]
+            if dir_col is not None:
+                new_row[dir_col] = str(load["direction"])
+            if val_col is not None:
+                new_row[val_col] = str(load["value"])
+            if csys_col is not None:
+                new_row[csys_col] = load["csys"]
+            table_data.extend(new_row)
+            num_records += 1
 
         ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
-        if isinstance(ret, (tuple, list)):
-            retcode = ret[-1]
-        else:
-            retcode = ret
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
         if retcode != 0:
             logger.debug("  SetTableForEditingArray failed (ret=%s)", retcode)
             return retcode
@@ -1060,19 +1062,26 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
         else:
             logger.info("  SAFE slab '%s' has no existing loads", safe_slab_name)
 
+        # Ensure load patterns exist in SAFE
         for load in loads:
             ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns)
-            ret = assign_load_to_safe(safe_model, safe_slab_name, load)
-            dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
-            if ret == 0:
-                loads_assigned += 1
+
+        # Assign all loads in one batched table operation
+        ret = assign_loads_batch_to_safe(safe_model, safe_slab_name, loads)
+        if ret == 0:
+            loads_assigned += len(loads)
+            status = "OK"
+            for load in loads:
                 logger.info("  Assigned: Pattern='%s', Value=%.4f -> OK",
                             load["load_pattern"], load["value"])
-                status = "OK"
-            else:
-                logger.error("  FAILED: Pattern='%s' (ret=%s)", load["load_pattern"], ret)
-                status = f"FAILED (ret={ret})"
+        else:
+            status = f"FAILED (ret={ret})"
+            logger.error("  FAILED to assign %d load(s) to '%s' (ret=%s)",
+                         len(loads), safe_slab_name, ret)
+
+        for load in loads:
+            dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             csv_rows.append({
                 "ETABS_UniqueName": area_name,
                 "ETABS_Label": label,

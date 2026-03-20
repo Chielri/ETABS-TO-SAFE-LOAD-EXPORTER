@@ -113,8 +113,9 @@ def get_etabs_label(etabs_model, area_name):
 
 
 def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
-    """Get shell uniform loads — tries direct API, then cached database tables for Load Sets."""
+    """Get shell uniform loads — tries direct API, element-level API, then database tables."""
     # 1) Try the standard direct API call
+    logger.info("  Check 1/3: AreaObj.GetLoadUniform (direct API)...")
     try:
         ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         logger.debug("  GetLoadUniform raw return: %s", ret)
@@ -133,13 +134,15 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                     "csys": str(ret[3][i]),
                 })
             if loads:
+                logger.info("  Check 1/3: Found %d load(s) via direct API.", len(loads))
                 return loads
-        logger.debug("  GetLoadUniform: retcode=%s, items=%s", retcode, number_items)
+        logger.info("  Check 1/3: No loads found (retcode=%s, items=%s).", retcode, number_items)
     except Exception as e:
-        logger.debug("  GetLoadUniform exception: %s", e)
+        logger.info("  Check 1/3: Not available (%s).", e)
 
     # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
     #    NOTE: Returns one entry per mesh element, so we must deduplicate.
+    logger.info("  Check 2/3: AreaElm.GetLoadUniform (element-level API)...")
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         logger.debug("  AreaElm.GetLoadUniform raw return: %s", ret)
@@ -165,19 +168,28 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                         "csys": csys,
                     })
             if loads:
+                logger.info("  Check 2/3: Found %d load(s) via element-level API.", len(loads))
                 return loads
-        logger.debug("  AreaElm.GetLoadUniform: retcode=%s, items=%s", retcode, number_items)
+        logger.info("  Check 2/3: No loads found (retcode=%s, items=%s).", retcode, number_items)
     except Exception as e:
-        logger.debug("  AreaElm.GetLoadUniform exception: %s", e)
+        logger.info("  Check 2/3: Not available (%s).", e)
 
-    # 3) Fallback: cached database tables (catches loads assigned via Load Sets)
+    # 3) Database tables (catches loads assigned via Load Sets)
+    logger.info("  Check 3/3: Database tables (cached)...")
     if table_cache is not None:
         loads = table_cache.get(area_name, [])
         if loads:
-            logger.debug("  Found %d load(s) from table cache for '%s'", len(loads), area_name)
+            logger.info("  Check 3/3: Found %d load(s) from table cache.", len(loads))
+        else:
+            logger.info("  Check 3/3: No loads found in table cache for '%s'.", area_name)
         return loads
-    logger.debug("  Trying database tables fallback for '%s'...", area_name)
-    return _get_uniform_loads_from_tables(etabs_model, area_name)
+    logger.info("  Check 3/3: Reading database tables for '%s'...", area_name)
+    loads = _get_uniform_loads_from_tables(etabs_model, area_name)
+    if loads:
+        logger.info("  Check 3/3: Found %d load(s) from database tables.", len(loads))
+    else:
+        logger.info("  Check 3/3: No loads found in database tables.")
+    return loads
 
 
 # Direction string-to-int mapping for database table values

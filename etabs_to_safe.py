@@ -91,11 +91,12 @@ def get_etabs_label(etabs_model, area_name):
 def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
     """Get all shell uniform loads assigned to an area object in ETABS.
 
-    Tries direct API first, then falls back to database tables for Load Sets.
+    Tries direct API, element-level API, then database tables.
     If table_cache is provided, uses pre-loaded table data instead of re-reading.
     Returns a list of dicts with load details.
     """
     # 1) Try the standard direct API call
+    print(f"  Check 1/3: AreaObj.GetLoadUniform (direct API)...")
     try:
         ret = etabs_model.AreaObj.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
@@ -113,12 +114,15 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                     "csys": str(ret[3][i]),
                 })
             if loads:
+                print(f"  Check 1/3: Found {len(loads)} load(s) via direct API.")
                 return loads
+        print(f"  Check 1/3: No loads found (retcode={retcode}, items={number_items}).")
     except Exception as e:
-        print(f"  DEBUG: GetLoadUniform exception: {e}")
+        print(f"  Check 1/3: Not available ({e}).")
 
     # 2) Try element-level query (cAreaElm) — may see loads the object-level misses
     #    NOTE: Returns one entry per mesh element, so we must deduplicate.
+    print(f"  Check 2/3: AreaElm.GetLoadUniform (element-level API)...")
     try:
         ret = etabs_model.AreaElm.GetLoadUniform(area_name, 0, [], [], [], [], [], 0)
         retcode = ret[-1]
@@ -143,14 +147,28 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                         "csys": csys,
                     })
             if loads:
+                print(f"  Check 2/3: Found {len(loads)} load(s) via element-level API.")
                 return loads
-    except Exception:
-        pass
+        print(f"  Check 2/3: No loads found (retcode={retcode}, items={number_items}).")
+    except Exception as e:
+        print(f"  Check 2/3: Not available ({e}).")
 
-    # 3) Fallback: cached database tables (catches loads assigned via Load Sets)
+    # 3) Database tables (catches loads assigned via Load Sets)
+    print(f"  Check 3/3: Database tables (cached)...")
     if table_cache is not None:
-        return table_cache.get(area_name, [])
-    return _get_uniform_loads_from_tables(etabs_model, area_name)
+        loads = table_cache.get(area_name, [])
+        if loads:
+            print(f"  Check 3/3: Found {len(loads)} load(s) from table cache.")
+        else:
+            print(f"  Check 3/3: No loads found in table cache for '{area_name}'.")
+        return loads
+    print(f"  Check 3/3: Reading database tables for '{area_name}'...")
+    loads = _get_uniform_loads_from_tables(etabs_model, area_name)
+    if loads:
+        print(f"  Check 3/3: Found {len(loads)} load(s) from database tables.")
+    else:
+        print(f"  Check 3/3: No loads found in database tables.")
+    return loads
 
 
 # Direction string-to-int mapping for database table values
@@ -237,6 +255,8 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
                 if "uniform" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
                 elif "load set" in tl and ("area" in tl or "shell" in tl):
+                    all_tables.append(t)
+                elif "load set" in tl:
                     all_tables.append(t)
     except Exception:
         pass
@@ -354,6 +374,7 @@ def build_table_load_cache(etabs_model):
     """Pre-read all database tables for uniform loads and return a dict: area_name -> [loads].
 
     Reads the tables once and indexes by area name so each slab lookup is O(1).
+    Combines both direct uniform load tables AND Load Set resolution tables.
     Returns an empty dict if tables are unavailable.
     """
     cache = {}
@@ -370,10 +391,14 @@ def build_table_load_cache(etabs_model):
                     all_tables.append(t)
                 elif "load set" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
+                elif "load set" in tl:
+                    all_tables.append(t)
+            print(f"  Discovered {len(all_tables)} candidate load tables: {all_tables}")
     except Exception:
         return cache
 
-    # --- Step 1: Try direct uniform load tables ---
+    # --- Step 1: Direct uniform load tables ---
+    direct_count = 0
     for table_name in all_tables:
         tdata = _read_table(db, table_name)
         if tdata is None:
@@ -390,6 +415,7 @@ def build_table_load_cache(etabs_model):
         dir_col = _find_column(fields, "Dir", "Direction")
         csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
+        table_count = 0
         for row in range(num_records):
             start = row * num_fields
             row_data = table_data[start:start + num_fields]
@@ -405,37 +431,52 @@ def build_table_load_cache(etabs_model):
                 "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
+            table_count += 1
 
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) from '{table_name}'")
-            return cache
+        if table_count > 0:
+            direct_count += table_count
+            print(f"  Direct table '{table_name}': cached {table_count} load(s)")
 
-    # --- Step 2: Load Set resolution (two-table join) ---
+    if direct_count > 0:
+        print(f"  Step 1 total: {direct_count} direct load(s) for {len(cache)} slab(s)")
+
+    # --- Step 2: Load Set resolution (two-table join) — ALWAYS runs ---
     assign_table = None
     defn_table = None
     for t in all_tables:
         tl = t.lower()
         if "load set" in tl and ("assignment" in tl or "area load" in tl):
             assign_table = t
-        elif "load set" in tl and "shell" in tl and "assignment" not in tl and "area load" not in tl:
+        elif "load set" in tl and ("definition" in tl or "shell" in tl) \
+                and "assignment" not in tl and "area load" not in tl:
             defn_table = t
 
+    print(f"  Load Set tables: assign='{assign_table}', defn='{defn_table}'")
+
     if not assign_table or not defn_table:
+        print("  Load Set resolution skipped (tables not found)")
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
 
-    # Read assignment table: slab UniqueName -> LoadSet name(s)
+    # Read assignment table
     tdata = _read_table(db, assign_table)
     if tdata is None:
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
     fields, num_fields, num_records, table_data = tdata
 
     name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
     set_col = _find_column(fields, "LoadSet", "Load Set")
     if name_col is None or set_col is None:
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
 
-    # Build area_name -> set of load set names
     area_to_sets = {}
     for row in range(num_records):
         start = row * num_fields
@@ -445,11 +486,19 @@ def build_table_load_cache(etabs_model):
         area_to_sets.setdefault(row_data[name_col], set()).add(row_data[set_col])
 
     if not area_to_sets:
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
 
-    # Read definition table: LoadSet Name -> LoadPattern + LoadValue
+    print(f"  Found {len(area_to_sets)} slab(s) with Load Set assignments")
+
+    # Read definition table
     tdata = _read_table(db, defn_table)
     if tdata is None:
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
     fields, num_fields, num_records, table_data = tdata
 
@@ -460,9 +509,11 @@ def build_table_load_cache(etabs_model):
     csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
     if set_name_col is None or pat_col is None or val_col is None:
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) total")
         return cache
 
-    # Build load_set_name -> list of loads
     set_to_loads = {}
     for row in range(num_records):
         start = row * num_fields
@@ -480,15 +531,26 @@ def build_table_load_cache(etabs_model):
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         })
 
-    # Join: area_name -> loads via load set names
+    print(f"  Found {len(set_to_loads)} Load Set definition(s): {list(set_to_loads.keys())}")
+
+    # Join: area_name -> loads via load set names (merge into existing cache)
+    loadset_count = 0
+    loadset_slabs = 0
     for area_name, set_names in area_to_sets.items():
+        added = False
         for set_name in set_names:
             if set_name in set_to_loads:
                 cache.setdefault(area_name, []).extend(set_to_loads[set_name])
+                loadset_count += len(set_to_loads[set_name])
+                added = True
+        if added:
+            loadset_slabs += 1
+
+    print(f"  Step 2 total: {loadset_count} load(s) for {loadset_slabs} slab(s) via Load Set resolution")
 
     if cache:
         print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-              f"{len(cache)} slab(s) from Load Set tables")
+              f"{len(cache)} slab(s) total (direct + Load Set)")
 
     return cache
 

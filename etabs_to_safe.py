@@ -517,27 +517,28 @@ def build_table_load_cache(etabs_model):
 
     if not assign_table or not defn_table:
         print("  Load Set resolution skipped (tables not found)")
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+    else:
+        _resolve_load_sets(db, assign_table, defn_table, cache)
 
+    total_loads = sum(len(v) for v in cache.values()) if cache else 0
+    if total_loads > 0:
+        print(f"Cached {total_loads} load(s) for {len(cache)} slab(s) total")
+
+    return cache
+
+
+def _resolve_load_sets(db, assign_table, defn_table, cache):
+    """Resolve Load Set tables and merge results into cache. Modifies cache in place."""
     # Read assignment table
     tdata = _read_table(db, assign_table)
     if tdata is None:
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+        return
     fields, num_fields, num_records, table_data = tdata
 
     name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
     set_col = _find_column(fields, "LoadSet", "Load Set")
     if name_col is None or set_col is None:
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+        return
 
     area_to_sets = {}
     for row in range(num_records):
@@ -548,20 +549,14 @@ def build_table_load_cache(etabs_model):
         area_to_sets.setdefault(row_data[name_col], set()).add(row_data[set_col])
 
     if not area_to_sets:
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+        return
 
     print(f"  Found {len(area_to_sets)} slab(s) with Load Set assignments")
 
     # Read definition table
     tdata = _read_table(db, defn_table)
     if tdata is None:
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+        return
     fields, num_fields, num_records, table_data = tdata
 
     set_name_col = _find_column(fields, "Name", "LoadSet", "Load Set")
@@ -571,10 +566,7 @@ def build_table_load_cache(etabs_model):
     csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
     if set_name_col is None or pat_col is None or val_col is None:
-        if cache:
-            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-                  f"{len(cache)} slab(s) total")
-        return cache
+        return
 
     set_to_loads = {}
     for row in range(num_records):
@@ -609,12 +601,6 @@ def build_table_load_cache(etabs_model):
             loadset_slabs += 1
 
     print(f"  Step 2 total: {loadset_count} load(s) for {loadset_slabs} slab(s) via Load Set resolution")
-
-    if cache:
-        print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
-              f"{len(cache)} slab(s) total (direct + Load Set)")
-
-    return cache
 
 
 def get_safe_area_names(safe_model):
@@ -656,7 +642,7 @@ def get_safe_area_names(safe_model):
 
 
 def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
-    """Create the load pattern in SAFE if it doesn't already exist."""
+    """Create the load pattern in SAFE if it doesn't already exist. Mutates existing_patterns."""
     if pattern_name not in existing_patterns:
         # Type 8 = Other (generic). SelfWtMultiplier = 0. AddLoadCase = True.
         ret = safe_model.LoadPatterns.Add(pattern_name, 8, 0, True)
@@ -666,7 +652,6 @@ def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
             print(f"  Created load pattern '{pattern_name}' in SAFE.")
         else:
             print(f"  WARNING: Failed to create load pattern '{pattern_name}' (ret={retcode}).")
-    return existing_patterns
 
 
 def get_existing_load_patterns(safe_model):
@@ -728,6 +713,7 @@ def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
 def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
     """Delete existing uniform loads from a SAFE slab for the given load patterns."""
     deleted = 0
+    table_fallback = []
     # Try COM API first
     for pat in load_patterns:
         try:
@@ -738,21 +724,23 @@ def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
                 continue
         except Exception:
             pass
-        # Fallback: database tables
-        if _delete_load_via_tables(safe_model, slab_name, pat) == 0:
-            deleted += 1
+        table_fallback.append(pat)
+    # Batch-delete remaining patterns via database tables (single read/write/apply)
+    if table_fallback:
+        batch_deleted = _delete_loads_via_tables(safe_model, slab_name, table_fallback)
+        deleted += batch_deleted
     return deleted
 
 
-def _delete_load_via_tables(safe_model, slab_name, load_pattern):
-    """Delete a uniform load from SAFE via database tables API."""
+def _delete_loads_via_tables(safe_model, slab_name, load_patterns):
+    """Delete uniform loads from SAFE via database tables API (batched)."""
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
 
         ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
         if ret[-1] != 0:
-            return ret[-1]
+            return 0
 
         table_version = ret[0]
         fields = list(ret[1]) if ret[1] else []
@@ -760,37 +748,44 @@ def _delete_load_via_tables(safe_model, slab_name, load_pattern):
         table_data = list(ret[3]) if ret[3] else []
 
         if not fields or num_records == 0:
-            return -1
+            return 0
 
         num_fields = len(fields)
         name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
         pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
         if name_col is None or pat_col is None:
-            return -1
+            return 0
 
-        # Rebuild table data excluding rows matching slab_name + load_pattern
+        patterns_to_delete = set(load_patterns)
+
+        # Rebuild table data excluding rows matching slab_name + any pattern
         new_data = []
         new_records = 0
+        deleted = 0
         for row in range(num_records):
             start = row * num_fields
             row_data = table_data[start:start + num_fields]
             if len(row_data) < num_fields:
                 continue
-            if row_data[name_col] == slab_name and row_data[pat_col] == load_pattern:
-                continue  # Skip this row (delete it)
+            if row_data[name_col] == slab_name and row_data[pat_col] in patterns_to_delete:
+                deleted += 1
+                continue
             new_data.extend(row_data)
             new_records += 1
+
+        if deleted == 0:
+            return 0
 
         ret = db.SetTableForEditingArray(table_key, table_version, fields, new_records, new_data)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
         if retcode != 0:
-            return retcode
+            return 0
 
         ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
-        return retcode
+        return deleted if retcode == 0 else 0
     except Exception:
-        return -1
+        return 0
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
@@ -961,7 +956,7 @@ def main():
 
         # Ensure load patterns exist in SAFE and assign loads
         for load in loads:
-            existing_patterns = ensure_load_pattern_exists(
+            ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns
             )
             ret = assign_load_to_safe(safe_model, safe_slab_name, load)

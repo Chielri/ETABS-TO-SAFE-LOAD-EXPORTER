@@ -573,19 +573,23 @@ def build_table_load_cache(etabs_model):
 
     if not assign_table or not defn_table:
         logger.info("  Load Set resolution skipped (tables not found)")
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+    else:
+        _resolve_load_sets(db, assign_table, defn_table, cache)
 
+    total_loads = sum(len(v) for v in cache.values()) if cache else 0
+    if total_loads > 0:
+        logger.info("Cached %d load(s) for %d slab(s) total", total_loads, len(cache))
+
+    return cache
+
+
+def _resolve_load_sets(db, assign_table, defn_table, cache):
+    """Resolve Load Set tables and merge results into cache. Modifies cache in place."""
     # Read the assignment table to find which LoadSet(s) each slab uses
     tdata = _read_table(db, assign_table)
     if tdata is None:
         logger.info("  Assignment table '%s' is empty or unreadable", assign_table)
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+        return
     fields, num_fields, num_records, table_data = tdata
     logger.debug("  Assignment table '%s': fields=%s, records=%d", assign_table, fields, num_records)
 
@@ -594,10 +598,7 @@ def build_table_load_cache(etabs_model):
     if name_col is None or set_col is None:
         logger.info("  Assignment table missing columns (name=%s, set=%s), fields=%s",
                      name_col, set_col, fields)
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+        return
 
     # Build area_name -> set of load set names
     area_to_sets = {}
@@ -610,13 +611,9 @@ def build_table_load_cache(etabs_model):
 
     if not area_to_sets:
         logger.info("  No Load Set assignments found in assignment table")
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+        return
 
     logger.info("  Found %d slab(s) with Load Set assignments", len(area_to_sets))
-    # Log a sample of assignments for debugging
     sample_items = list(area_to_sets.items())[:10]
     for name, sets in sample_items:
         logger.debug("    Slab '%s' -> Load Set(s): %s", name, sets)
@@ -627,10 +624,7 @@ def build_table_load_cache(etabs_model):
     tdata = _read_table(db, defn_table)
     if tdata is None:
         logger.info("  Definition table '%s' is empty or unreadable", defn_table)
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+        return
     fields, num_fields, num_records, table_data = tdata
     logger.debug("  Definition table '%s': fields=%s, records=%d", defn_table, fields, num_records)
 
@@ -643,10 +637,7 @@ def build_table_load_cache(etabs_model):
     if set_name_col is None or pat_col is None or val_col is None:
         logger.info("  Definition table missing columns (set_name=%s, pat=%s, val=%s), fields=%s",
                      set_name_col, pat_col, val_col, fields)
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) total",
-                        sum(len(v) for v in cache.values()), len(cache))
-        return cache
+        return
 
     # Build load_set_name -> list of loads
     set_to_loads = {}
@@ -689,12 +680,6 @@ def build_table_load_cache(etabs_model):
 
     logger.info("  Step 2 total: %d load(s) for %d slab(s) via Load Set resolution",
                 loadset_count, loadset_slabs)
-
-    if cache:
-        logger.info("Cached %d load(s) for %d slab(s) total (direct + Load Set)",
-                    sum(len(v) for v in cache.values()), len(cache))
-
-    return cache
 
 
 def get_safe_area_names(safe_model):
@@ -747,6 +732,7 @@ def get_existing_load_patterns(safe_model):
 
 
 def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
+    """Create the load pattern in SAFE if it doesn't already exist. Mutates existing_patterns."""
     if pattern_name not in existing_patterns:
         ret = safe_model.LoadPatterns.Add(pattern_name, 8, 0, True)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
@@ -755,7 +741,6 @@ def ensure_load_pattern_exists(safe_model, pattern_name, existing_patterns):
             logger.info("  Created load pattern '%s' in SAFE.", pattern_name)
         else:
             logger.warning("  Failed to create load pattern '%s' (ret=%s).", pattern_name, retcode)
-    return existing_patterns
 
 
 def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
@@ -808,6 +793,7 @@ def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
 def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
     """Delete existing uniform loads from a SAFE slab for the given load patterns."""
     deleted = 0
+    table_fallback = []
     # Try COM API first
     for pat in load_patterns:
         try:
@@ -818,21 +804,23 @@ def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
                 continue
         except Exception:
             pass
-        # Fallback: database tables
-        if _delete_load_via_tables(safe_model, slab_name, pat) == 0:
-            deleted += 1
+        table_fallback.append(pat)
+    # Batch-delete remaining patterns via database tables (single read/write/apply)
+    if table_fallback:
+        batch_deleted = _delete_loads_via_tables(safe_model, slab_name, table_fallback)
+        deleted += batch_deleted
     return deleted
 
 
-def _delete_load_via_tables(safe_model, slab_name, load_pattern):
-    """Delete a uniform load from SAFE via database tables API."""
+def _delete_loads_via_tables(safe_model, slab_name, load_patterns):
+    """Delete uniform loads from SAFE via database tables API (batched)."""
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
 
         ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
         if ret[-1] != 0:
-            return ret[-1]
+            return 0
 
         table_version = ret[0]
         fields = list(ret[1]) if ret[1] else []
@@ -840,38 +828,45 @@ def _delete_load_via_tables(safe_model, slab_name, load_pattern):
         table_data = list(ret[3]) if ret[3] else []
 
         if not fields or num_records == 0:
-            return -1
+            return 0
 
         num_fields = len(fields)
         name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
         pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
         if name_col is None or pat_col is None:
-            return -1
+            return 0
 
-        # Rebuild table data excluding rows matching slab_name + load_pattern
+        patterns_to_delete = set(load_patterns)
+
+        # Rebuild table data excluding rows matching slab_name + any pattern
         new_data = []
         new_records = 0
+        deleted = 0
         for row in range(num_records):
             start = row * num_fields
             row_data = table_data[start:start + num_fields]
             if len(row_data) < num_fields:
                 continue
-            if row_data[name_col] == slab_name and row_data[pat_col] == load_pattern:
-                continue  # Skip this row (delete it)
+            if row_data[name_col] == slab_name and row_data[pat_col] in patterns_to_delete:
+                deleted += 1
+                continue
             new_data.extend(row_data)
             new_records += 1
+
+        if deleted == 0:
+            return 0
 
         ret = db.SetTableForEditingArray(table_key, table_version, fields, new_records, new_data)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
         if retcode != 0:
-            return retcode
+            return 0
 
         ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
-        return retcode
+        return deleted if retcode == 0 else 0
     except Exception as e:
         logger.debug("  Database table load deletion failed: %s", e)
-        return -1
+        return 0
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
@@ -1047,7 +1042,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
             logger.info("  SAFE slab '%s' has no existing loads", safe_slab_name)
 
         for load in loads:
-            existing_patterns = ensure_load_pattern_exists(
+            ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns)
             ret = assign_load_to_safe(safe_model, safe_slab_name, load)
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")

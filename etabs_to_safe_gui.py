@@ -280,6 +280,8 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
                     all_tables.append(t)
                 elif "load set" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
+                elif "load set" in tl:
+                    all_tables.append(t)
             logger.debug("  Discovered load tables: %s", all_tables)
     except Exception as e:
         logger.debug("  GetAvailableTables error: %s", e)
@@ -411,31 +413,39 @@ def build_table_load_cache(etabs_model):
     """Pre-read all database tables for uniform loads and return a dict: area_name -> [loads].
 
     Reads the tables once and indexes by area name so each slab lookup is O(1).
+    Combines both direct uniform load tables AND Load Set resolution tables.
     Returns an empty dict if tables are unavailable.
     """
     cache = {}
     db = etabs_model.DatabaseTables
 
-    # Discover candidate table names
+    # Discover ALL candidate table names (not just load-related ones for debug)
     all_tables = []
+    all_available = []
     try:
         ret = db.GetAvailableTables(0, [], [], [])
         if ret[-1] == 0 and ret[1]:
-            for t in ret[1]:
+            all_available = list(ret[1])
+            for t in all_available:
                 tl = t.lower()
                 if "uniform" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
                 elif "load set" in tl and ("area" in tl or "shell" in tl):
                     all_tables.append(t)
-            logger.debug("  Discovered load tables: %s", all_tables)
+                elif "load set" in tl:
+                    all_tables.append(t)
+            logger.debug("  All available tables (%d): %s", len(all_available), all_available)
+            logger.info("  Discovered %d candidate load tables: %s", len(all_tables), all_tables)
     except Exception as e:
-        logger.debug("  GetAvailableTables error: %s", e)
+        logger.warning("  GetAvailableTables error: %s", e)
         return cache
 
-    # --- Step 1: Try direct uniform load tables ---
+    # --- Step 1: Direct uniform load tables ---
+    direct_count = 0
     for table_name in all_tables:
         tdata = _read_table(db, table_name)
         if tdata is None:
+            logger.debug("  Table '%s': no data or read failed", table_name)
             continue
         fields, num_fields, num_records, table_data = tdata
 
@@ -444,11 +454,16 @@ def build_table_load_cache(etabs_model):
         val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value", "Load")
 
         if name_col is None or pat_col is None or val_col is None:
+            logger.debug("  Table '%s': missing required columns (name=%s, pat=%s, val=%s), fields=%s",
+                         table_name, name_col, pat_col, val_col, fields)
             continue
 
         dir_col = _find_column(fields, "Dir", "Direction")
         csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+        logger.debug("  Table '%s': columns name=%d, pat=%d, val=%d, dir=%s, csys=%s",
+                     table_name, name_col, pat_col, val_col, dir_col, csys_col)
 
+        table_count = 0
         for row in range(num_records):
             start = row * num_fields
             row_data = table_data[start:start + num_fields]
@@ -464,37 +479,61 @@ def build_table_load_cache(etabs_model):
                 "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
+            table_count += 1
 
-        if cache:
-            logger.info("Cached %d load(s) for %d slab(s) from '%s'",
-                        sum(len(v) for v in cache.values()), len(cache), table_name)
-            return cache
+        if table_count > 0:
+            direct_count += table_count
+            logger.info("  Direct table '%s': cached %d load(s) for %d slab(s)",
+                        table_name, table_count, len(set(
+                            table_data[row * num_fields + name_col]
+                            for row in range(num_records)
+                            if row * num_fields + num_fields <= len(table_data)
+                            and not str(table_data[row * num_fields + pat_col]).startswith("~")
+                        )))
 
-    # --- Step 2: Load Set resolution (two-table join) ---
+    if direct_count > 0:
+        logger.info("  Step 1 total: %d direct load(s) for %d slab(s)",
+                    direct_count, len(cache))
+
+    # --- Step 2: Load Set resolution (two-table join) — ALWAYS runs ---
     assign_table = None
     defn_table = None
     for t in all_tables:
         tl = t.lower()
         if "load set" in tl and ("assignment" in tl or "area load" in tl):
             assign_table = t
-        elif "load set" in tl and "shell" in tl and "assignment" not in tl and "area load" not in tl:
+        elif "load set" in tl and ("definition" in tl or "shell" in tl) \
+                and "assignment" not in tl and "area load" not in tl:
             defn_table = t
 
-    logger.debug("  Load Set tables: assign='%s', defn='%s'", assign_table, defn_table)
+    logger.info("  Load Set tables: assign='%s', defn='%s'", assign_table, defn_table)
 
     if not assign_table or not defn_table:
+        logger.info("  Load Set resolution skipped (tables not found)")
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
 
-    # Read assignment table: slab UniqueName -> LoadSet name(s)
+    # Read the assignment table to find which LoadSet(s) each slab uses
     tdata = _read_table(db, assign_table)
     if tdata is None:
+        logger.info("  Assignment table '%s' is empty or unreadable", assign_table)
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
     fields, num_fields, num_records, table_data = tdata
+    logger.debug("  Assignment table '%s': fields=%s, records=%d", assign_table, fields, num_records)
 
     name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
     set_col = _find_column(fields, "LoadSet", "Load Set")
     if name_col is None or set_col is None:
-        logger.debug("  Assignment table missing UniqueName or LoadSet column")
+        logger.info("  Assignment table missing columns (name=%s, set=%s), fields=%s",
+                     name_col, set_col, fields)
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
 
     # Build area_name -> set of load set names
@@ -507,14 +546,30 @@ def build_table_load_cache(etabs_model):
         area_to_sets.setdefault(row_data[name_col], set()).add(row_data[set_col])
 
     if not area_to_sets:
-        logger.debug("  No Load Set assignments found in table")
+        logger.info("  No Load Set assignments found in assignment table")
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
+
+    logger.info("  Found %d slab(s) with Load Set assignments", len(area_to_sets))
+    # Log a sample of assignments for debugging
+    sample_items = list(area_to_sets.items())[:10]
+    for name, sets in sample_items:
+        logger.debug("    Slab '%s' -> Load Set(s): %s", name, sets)
+    if len(area_to_sets) > 10:
+        logger.debug("    ... and %d more", len(area_to_sets) - 10)
 
     # Read definition table: LoadSet Name -> LoadPattern + LoadValue
     tdata = _read_table(db, defn_table)
     if tdata is None:
+        logger.info("  Definition table '%s' is empty or unreadable", defn_table)
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
     fields, num_fields, num_records, table_data = tdata
+    logger.debug("  Definition table '%s': fields=%s, records=%d", defn_table, fields, num_records)
 
     set_name_col = _find_column(fields, "Name", "LoadSet", "Load Set")
     pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
@@ -523,7 +578,11 @@ def build_table_load_cache(etabs_model):
     csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
     if set_name_col is None or pat_col is None or val_col is None:
-        logger.debug("  Definition table missing required columns")
+        logger.info("  Definition table missing columns (set_name=%s, pat=%s, val=%s), fields=%s",
+                     set_name_col, pat_col, val_col, fields)
+        if cache:
+            logger.info("Cached %d load(s) for %d slab(s) total",
+                        sum(len(v) for v in cache.values()), len(cache))
         return cache
 
     # Build load_set_name -> list of loads
@@ -544,14 +603,32 @@ def build_table_load_cache(etabs_model):
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         })
 
-    # Join: area_name -> loads via load set names
+    logger.info("  Found %d Load Set definition(s): %s", len(set_to_loads), list(set_to_loads.keys()))
+    for set_name, loads in set_to_loads.items():
+        for ld in loads:
+            logger.debug("    LoadSet '%s': pat='%s', dir=%s, val=%s",
+                         set_name, ld["load_pattern"], ld["direction"], ld["value"])
+
+    # Join: area_name -> loads via load set names (merge into existing cache)
+    loadset_count = 0
+    loadset_slabs = 0
     for area_name, set_names in area_to_sets.items():
+        added = False
         for set_name in set_names:
             if set_name in set_to_loads:
                 cache.setdefault(area_name, []).extend(set_to_loads[set_name])
+                loadset_count += len(set_to_loads[set_name])
+                added = True
+            else:
+                logger.debug("    Slab '%s': Load Set '%s' not found in definitions", area_name, set_name)
+        if added:
+            loadset_slabs += 1
+
+    logger.info("  Step 2 total: %d load(s) for %d slab(s) via Load Set resolution",
+                loadset_count, loadset_slabs)
 
     if cache:
-        logger.info("Cached %d load(s) for %d slab(s) from Load Set tables",
+        logger.info("Cached %d load(s) for %d slab(s) total (direct + Load Set)",
                     sum(len(v) for v in cache.values()), len(cache))
 
     return cache
@@ -1071,12 +1148,29 @@ class App(tk.Tk):
         self.text_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
                                                           datefmt="%H:%M:%S"))
         logger.addHandler(self.text_handler)
-        logger.setLevel(logging.INFO)
+
+        # Always write a debug log file (captures everything regardless of GUI level)
+        self._debug_log_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        self.file_handler = logging.FileHandler(self._debug_log_path, encoding="utf-8")
+        self.file_handler.setLevel(logging.DEBUG)
+        self.file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(levelname)-5s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        logger.addHandler(self.file_handler)
+        logger.setLevel(logging.DEBUG)
+
+        # GUI text handler defaults to INFO (user toggles with Debug checkbox)
+        self.text_handler.setLevel(logging.INFO)
+        logger.info("Debug log file: %s", self._debug_log_path)
 
     def _toggle_debug(self):
         level = logging.DEBUG if self.debug_var.get() else logging.INFO
-        logger.setLevel(level)
-        logger.info("Log level set to %s", logging.getLevelName(level))
+        self.text_handler.setLevel(level)
+        logger.info("GUI log level set to %s (file log always DEBUG)", logging.getLevelName(level))
 
     # -- Actions -------------------------------------------------------------
 
@@ -1222,6 +1316,8 @@ class App(tk.Tk):
         csv_path = ""
         if csv_rows and self.csv_var.get():
             csv_path = self._save_csv(csv_rows)
+
+        logger.info("Debug log saved to: %s", self._debug_log_path)
 
         status_msg = (
             f"Done! Matched: {summary['matched']}, "

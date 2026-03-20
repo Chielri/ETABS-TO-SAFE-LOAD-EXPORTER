@@ -88,10 +88,11 @@ def get_etabs_label(etabs_model, area_name):
     return label, story
 
 
-def get_shell_uniform_loads(etabs_model, area_name):
+def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
     """Get all shell uniform loads assigned to an area object in ETABS.
 
     Tries direct API first, then falls back to database tables for Load Sets.
+    If table_cache is provided, uses pre-loaded table data instead of re-reading.
     Returns a list of dicts with load details.
     """
     # 1) Try the standard direct API call
@@ -146,7 +147,9 @@ def get_shell_uniform_loads(etabs_model, area_name):
     except Exception:
         pass
 
-    # 3) Fallback: database tables (catches loads assigned via Load Sets)
+    # 3) Fallback: cached database tables (catches loads assigned via Load Sets)
+    if table_cache is not None:
+        return table_cache.get(area_name, [])
     return _get_uniform_loads_from_tables(etabs_model, area_name)
 
 
@@ -347,6 +350,149 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
     return loads
 
 
+def build_table_load_cache(etabs_model):
+    """Pre-read all database tables for uniform loads and return a dict: area_name -> [loads].
+
+    Reads the tables once and indexes by area name so each slab lookup is O(1).
+    Returns an empty dict if tables are unavailable.
+    """
+    cache = {}
+    db = etabs_model.DatabaseTables
+
+    # Discover candidate table names
+    all_tables = []
+    try:
+        ret = db.GetAvailableTables(0, [], [], [])
+        if ret[-1] == 0 and ret[1]:
+            for t in ret[1]:
+                tl = t.lower()
+                if "uniform" in tl and ("area" in tl or "shell" in tl):
+                    all_tables.append(t)
+                elif "load set" in tl and ("area" in tl or "shell" in tl):
+                    all_tables.append(t)
+    except Exception:
+        return cache
+
+    # --- Step 1: Try direct uniform load tables ---
+    for table_name in all_tables:
+        tdata = _read_table(db, table_name)
+        if tdata is None:
+            continue
+        fields, num_fields, num_records, table_data = tdata
+
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
+        val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value", "Load")
+
+        if name_col is None or pat_col is None or val_col is None:
+            continue
+
+        dir_col = _find_column(fields, "Dir", "Direction")
+        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+
+        for row in range(num_records):
+            start = row * num_fields
+            row_data = table_data[start:start + num_fields]
+            if len(row_data) < num_fields:
+                continue
+            pat = row_data[pat_col]
+            if str(pat).startswith("~"):
+                continue
+            name = row_data[name_col]
+            cache.setdefault(name, []).append({
+                "load_pattern": pat,
+                "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
+                "value": float(row_data[val_col]),
+                "csys": row_data[csys_col] if csys_col is not None else "Global",
+            })
+
+        if cache:
+            print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+                  f"{len(cache)} slab(s) from '{table_name}'")
+            return cache
+
+    # --- Step 2: Load Set resolution (two-table join) ---
+    assign_table = None
+    defn_table = None
+    for t in all_tables:
+        tl = t.lower()
+        if "load set" in tl and ("assignment" in tl or "area load" in tl):
+            assign_table = t
+        elif "load set" in tl and "shell" in tl and "assignment" not in tl and "area load" not in tl:
+            defn_table = t
+
+    if not assign_table or not defn_table:
+        return cache
+
+    # Read assignment table: slab UniqueName -> LoadSet name(s)
+    tdata = _read_table(db, assign_table)
+    if tdata is None:
+        return cache
+    fields, num_fields, num_records, table_data = tdata
+
+    name_col = _find_column(fields, "UniqueName", "Unique Name", "AreaName")
+    set_col = _find_column(fields, "LoadSet", "Load Set")
+    if name_col is None or set_col is None:
+        return cache
+
+    # Build area_name -> set of load set names
+    area_to_sets = {}
+    for row in range(num_records):
+        start = row * num_fields
+        row_data = table_data[start:start + num_fields]
+        if len(row_data) < num_fields:
+            continue
+        area_to_sets.setdefault(row_data[name_col], set()).add(row_data[set_col])
+
+    if not area_to_sets:
+        return cache
+
+    # Read definition table: LoadSet Name -> LoadPattern + LoadValue
+    tdata = _read_table(db, defn_table)
+    if tdata is None:
+        return cache
+    fields, num_fields, num_records, table_data = tdata
+
+    set_name_col = _find_column(fields, "Name", "LoadSet", "Load Set")
+    pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern", "Pattern")
+    val_col = _find_column(fields, "LoadValue", "Load Value", "UnifLoad", "Uniform Load", "Value", "Load")
+    dir_col = _find_column(fields, "Dir", "Direction")
+    csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
+
+    if set_name_col is None or pat_col is None or val_col is None:
+        return cache
+
+    # Build load_set_name -> list of loads
+    set_to_loads = {}
+    for row in range(num_records):
+        start = row * num_fields
+        row_data = table_data[start:start + num_fields]
+        if len(row_data) < num_fields:
+            continue
+        set_name = row_data[set_name_col]
+        pat = row_data[pat_col]
+        if str(pat).startswith("~"):
+            continue
+        set_to_loads.setdefault(set_name, []).append({
+            "load_pattern": pat,
+            "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
+            "value": float(row_data[val_col]),
+            "csys": row_data[csys_col] if csys_col is not None else "Global",
+        })
+
+    # Join: area_name -> loads via load set names
+    for area_name, set_names in area_to_sets.items():
+        for set_name in set_names:
+            if set_name in set_to_loads:
+                cache.setdefault(area_name, []).extend(set_to_loads[set_name])
+
+    if cache:
+        print(f"Cached {sum(len(v) for v in cache.values())} load(s) for "
+              f"{len(cache)} slab(s) from Load Set tables")
+
+    return cache
+
+
 def get_safe_area_names(safe_model):
     """Get all area object names in SAFE and return as a set for fast lookup."""
     # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
@@ -409,6 +555,115 @@ def get_existing_load_patterns(safe_model):
         return set()
     names = ret[1]
     return set(names) if names else set()
+
+
+def get_safe_slab_loads(safe_model, slab_name):
+    """Get existing uniform loads on a SAFE slab. Returns list of load pattern names."""
+    # Try COM API first
+    try:
+        ret = safe_model.AreaObj.GetLoadUniform(slab_name, 0, [], [], [], [], [], 0)
+        retcode = ret[-1]
+        number_items = ret[0]
+        if retcode == 0 and number_items > 0:
+            patterns = []
+            for i in range(number_items):
+                patterns.append(str(ret[2][i]))
+            return patterns
+    except Exception:
+        pass
+
+    # Fallback: database tables
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+        ret = db.GetTableForDisplayArray(table_key, [], "", 0, [], 0, [])
+        if ret[-1] == 0 and ret[4]:
+            fields = list(ret[2]) if ret[2] else []
+            num_records = ret[3]
+            table_data = list(ret[4])
+            num_fields = len(fields)
+            name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+            pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+            if name_col is not None and pat_col is not None:
+                patterns = []
+                for row in range(num_records):
+                    start = row * num_fields
+                    if start + num_fields <= len(table_data):
+                        if table_data[start + name_col] == slab_name:
+                            patterns.append(table_data[start + pat_col])
+                return patterns
+    except Exception:
+        pass
+
+    return []
+
+
+def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
+    """Delete existing uniform loads from a SAFE slab for the given load patterns."""
+    deleted = 0
+    # Try COM API first
+    for pat in load_patterns:
+        try:
+            ret = safe_model.AreaObj.DeleteLoadUniform(slab_name, pat)
+            retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+            if retcode == 0:
+                deleted += 1
+                continue
+        except Exception:
+            pass
+        # Fallback: database tables
+        if _delete_load_via_tables(safe_model, slab_name, pat) == 0:
+            deleted += 1
+    return deleted
+
+
+def _delete_load_via_tables(safe_model, slab_name, load_pattern):
+    """Delete a uniform load from SAFE via database tables API."""
+    try:
+        db = safe_model.DatabaseTables
+        table_key = "Area Load Assignments - Uniform"
+
+        ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
+        if ret[-1] != 0:
+            return ret[-1]
+
+        table_version = ret[0]
+        fields = list(ret[1]) if ret[1] else []
+        num_records = ret[2]
+        table_data = list(ret[3]) if ret[3] else []
+
+        if not fields or num_records == 0:
+            return -1
+
+        num_fields = len(fields)
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+        if name_col is None or pat_col is None:
+            return -1
+
+        # Rebuild table data excluding rows matching slab_name + load_pattern
+        new_data = []
+        new_records = 0
+        for row in range(num_records):
+            start = row * num_fields
+            row_data = table_data[start:start + num_fields]
+            if len(row_data) < num_fields:
+                continue
+            if row_data[name_col] == slab_name and row_data[pat_col] == load_pattern:
+                continue  # Skip this row (delete it)
+            new_data.extend(row_data)
+            new_records += 1
+
+        ret = db.SetTableForEditingArray(table_key, table_version, fields, new_records, new_data)
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        if retcode != 0:
+            return retcode
+
+        ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
+        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
+        return retcode
+    except Exception:
+        return -1
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
@@ -523,6 +778,9 @@ def main():
     print(f"Existing load patterns in SAFE: {existing_patterns}")
     print()
 
+    # Pre-cache database table loads (avoids re-reading tables per slab)
+    table_cache = build_table_load_cache(etabs_model)
+
     # Process each selected slab
     matched = 0
     unmatched = 0
@@ -533,7 +791,7 @@ def main():
         print(f"ETABS slab: '{area_name}' (Label: '{label}', Story: '{story}')")
 
         # Get loads from ETABS
-        loads = get_shell_uniform_loads(etabs_model, area_name)
+        loads = get_shell_uniform_loads(etabs_model, area_name, table_cache=table_cache)
         if not loads:
             print(f"  No uniform loads assigned. Skipping.")
             continue
@@ -557,6 +815,16 @@ def main():
 
         print(f"  Matched to SAFE slab: '{safe_slab_name}'")
         matched += 1
+
+        # Check for existing loads on SAFE slab and delete them before overwriting
+        existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name)
+        if existing_safe_loads:
+            unique_patterns = sorted(set(existing_safe_loads))
+            print(f"  Existing loads in SAFE: {unique_patterns}")
+            deleted = delete_safe_slab_loads(safe_model, safe_slab_name, unique_patterns)
+            print(f"  Deleted {deleted} existing load pattern(s) from SAFE slab")
+        else:
+            print(f"  No existing loads on SAFE slab (clean)")
 
         # Ensure load patterns exist in SAFE and assign loads
         for load in loads:

@@ -630,24 +630,43 @@ def get_safe_area_names(safe_model):
     except Exception:
         pass
 
-    # Fallback: database tables (required for SAFE v22+)
+    Primary: COM AreaObj.GetNameList (works via ETABS COM layer inheritance).
+    Fallback: database tables for SAFE versions that don't expose AreaObj.
+    """
+    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
+    try:
+        ret = safe_model.AreaObj.GetNameList(0, [])
+        retcode = ret[-1]
+        if retcode == 0 and ret[1]:
+            name_set = set(ret[1])
+            print(f"Found {len(name_set)} area object(s) in SAFE.")
+            return name_set
+    except Exception:
+        pass
+
+    # Fallback: database tables
     try:
         db = safe_model.DatabaseTables
-        ret = db.GetTableForDisplayArray("Objects and Elements - Areas", [], "", 0, [], 0, [])
-        if ret[-1] == 0 and ret[4]:
-            fields = list(ret[2]) if ret[2] else []
-            num_records = ret[3]
-            table_data = list(ret[4])
+        for table_name in [
+            "Objects and Elements - Areas",
+            "Area Object Connectivity",
+            "Objects - Area Objects",
+            "Area Section Assignments",
+        ]:
+            tdata = _read_table(db, table_name)
+            if tdata is None:
+                continue
+            fields, num_fields, num_records, table_data = tdata
             name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
-            if name_col is not None:
-                num_fields = len(fields)
-                name_set = set()
-                for row in range(num_records):
-                    start = row * num_fields
-                    if start + name_col < len(table_data):
-                        name_set.add(table_data[start + name_col])
-                print(f"Found {len(name_set)} area object(s) in SAFE (via tables).")
-                return name_set
+            if name_col is None:
+                continue
+            name_set = set()
+            for row in range(num_records):
+                start = row * num_fields
+                if start + name_col < len(table_data):
+                    name_set.add(table_data[start + name_col])
+            print(f"Found {len(name_set)} area object(s) in SAFE (via tables).")
+            return name_set
     except Exception:
         pass
 
@@ -728,86 +747,28 @@ def get_safe_slab_loads(safe_model, slab_name, safe_load_cache=None):
 def delete_safe_slab_loads(safe_model, slab_name, load_patterns):
     """Delete existing uniform loads from a SAFE slab for the given load patterns."""
     deleted = 0
-    # Try COM API first
     for pat in load_patterns:
         try:
             ret = safe_model.AreaObj.DeleteLoadUniform(slab_name, pat)
             retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
             if retcode == 0:
                 deleted += 1
-                continue
         except Exception:
             pass
-        # Fallback: database tables
-        if _delete_load_via_tables(safe_model, slab_name, pat) == 0:
-            deleted += 1
     return deleted
-
-
-def _delete_load_via_tables(safe_model, slab_name, load_pattern):
-    """Delete a uniform load from SAFE via database tables API."""
-    try:
-        db = safe_model.DatabaseTables
-        table_key = "Area Load Assignments - Uniform"
-
-        ret = db.GetTableForEditingArray(table_key, "", 0, [], 0, [])
-        if ret[-1] != 0:
-            return ret[-1]
-
-        table_version = ret[0]
-        fields = list(ret[1]) if ret[1] else []
-        num_records = ret[2]
-        table_data = list(ret[3]) if ret[3] else []
-
-        if not fields or num_records == 0:
-            return -1
-
-        num_fields = len(fields)
-        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
-        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
-        if name_col is None or pat_col is None:
-            return -1
-
-        # Rebuild table data excluding rows matching slab_name + load_pattern
-        new_data = []
-        new_records = 0
-        for row in range(num_records):
-            start = row * num_fields
-            row_data = table_data[start:start + num_fields]
-            if len(row_data) < num_fields:
-                continue
-            if row_data[name_col] == slab_name and row_data[pat_col] == load_pattern:
-                continue  # Skip this row (delete it)
-            new_data.extend(row_data)
-            new_records += 1
-
-        ret = db.SetTableForEditingArray(table_key, table_version, fields, new_records, new_data)
-        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
-        if retcode != 0:
-            return retcode
-
-        ret = db.ApplyEditedTables(True, 0, 0, 0, 0, "")
-        retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
-        return retcode
-    except Exception:
-        return -1
 
 
 def assign_load_to_safe(safe_model, slab_name, load):
     """Assign a single shell uniform load to a slab in SAFE.
 
-    Tries COM AreaObj first, then falls back to database tables.
+    Primary: COM AreaObj.SetLoadUniform (works via ETABS COM layer inheritance).
+    Fallback: database tables.
     Returns 0 on success, non-zero on failure.
     """
-    # Try COM AreaObj first (works in some SAFE versions via ETABS COM layer)
     try:
         ret = safe_model.AreaObj.SetLoadUniform(
-            slab_name,
-            load["load_pattern"],
-            load["value"],
-            load["direction"],
-            True,
-            load["csys"],
+            slab_name, load["load_pattern"], load["value"],
+            load["direction"], True, load["csys"],
         )
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
         if retcode == 0:
@@ -815,12 +776,7 @@ def assign_load_to_safe(safe_model, slab_name, load):
     except Exception:
         pass
 
-    # Fallback: database tables (required for SAFE v22+)
-    return _assign_load_via_tables(safe_model, slab_name, load)
-
-
-def _assign_load_via_tables(safe_model, slab_name, load):
-    """Assign a uniform load to SAFE via database tables API."""
+    # Fallback: database tables
     try:
         db = safe_model.DatabaseTables
         table_key = "Area Load Assignments - Uniform"
@@ -838,23 +794,25 @@ def _assign_load_via_tables(safe_model, slab_name, load):
             return -1
 
         num_fields = len(fields)
+        name_col = _find_column(fields, "UniqueName", "Unique Name", "Name")
+        pat_col = _find_column(fields, "LoadPat", "Load Pattern", "LoadPattern")
+        dir_col = _find_column(fields, "Dir", "Direction")
+        val_col = _find_column(fields, "UnifLoad", "Uniform Load", "Value")
+        csys_col = _find_column(fields, "CSys", "CoordSys", "Coord Sys")
 
         new_row = [""] * num_fields
-        for idx, f in enumerate(fields):
-            fl = f.lower().strip()
-            if fl in ("uniquename", "unique name", "name"):
-                new_row[idx] = slab_name
-            elif fl in ("loadpat", "load pattern", "loadpattern"):
-                new_row[idx] = load["load_pattern"]
-            elif fl in ("dir", "direction"):
-                new_row[idx] = str(load["direction"])
-            elif fl in ("unifload", "uniform load", "value"):
-                new_row[idx] = str(load["value"])
-            elif fl in ("csys", "coordsys", "coord sys"):
-                new_row[idx] = load["csys"]
-
-        num_records += 1
+        if name_col is not None:
+            new_row[name_col] = slab_name
+        if pat_col is not None:
+            new_row[pat_col] = load["load_pattern"]
+        if dir_col is not None:
+            new_row[dir_col] = str(load["direction"])
+        if val_col is not None:
+            new_row[val_col] = str(load["value"])
+        if csys_col is not None:
+            new_row[csys_col] = load["csys"]
         table_data.extend(new_row)
+        num_records += 1
 
         ret = db.SetTableForEditingArray(table_key, table_version, fields, num_records, table_data)
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
@@ -937,7 +895,6 @@ def main():
         # Match to SAFE slab using the ETABS label as the SAFE unique name
         safe_slab_name = label
         if safe_slab_name not in safe_area_names:
-            # Try with the full ETABS name as fallback
             if area_name in safe_area_names:
                 safe_slab_name = area_name
             else:
@@ -949,7 +906,7 @@ def main():
         print(f"  Matched to SAFE slab: '{safe_slab_name}'")
         matched += 1
 
-        # Check for existing loads on SAFE slab and delete them before overwriting
+        # Delete existing loads on SAFE slab before overwriting
         existing_safe_loads = get_safe_slab_loads(safe_model, safe_slab_name, safe_load_cache=safe_load_cache)
         if existing_safe_loads:
             unique_patterns = sorted(set(existing_safe_loads))
@@ -964,14 +921,17 @@ def main():
             existing_patterns = ensure_load_pattern_exists(
                 safe_model, load["load_pattern"], existing_patterns
             )
+
+        # Assign loads via COM (fast per-slab calls)
+        for load in loads:
             ret = assign_load_to_safe(safe_model, safe_slab_name, load)
             if ret == 0:
                 loads_assigned += 1
                 print(f"  Assigned: Pattern='{load['load_pattern']}', "
                       f"Value={load['value']:.4f} -> OK")
             else:
-                print(f"  FAILED to assign: Pattern='{load['load_pattern']}' "
-                      f"(ret={ret})")
+                print(f"  FAILED: Pattern='{load['load_pattern']}', "
+                      f"Value={load['value']:.4f} (ret={ret})")
 
     # Refresh SAFE view
     safe_model.View.RefreshView(0, False)

@@ -178,7 +178,7 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                 loads.append({
                     "load_pattern": pat,
                     "direction": int(ret[4][i]),
-                    "value": -float(ret[5][i]),
+                    "value": float(ret[5][i]),
                     "csys": str(ret[3][i]),
                 })
             if loads:
@@ -202,7 +202,7 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                 if pat.startswith("~"):
                     continue
                 direction = int(ret[4][i])
-                value = -float(ret[5][i])
+                value = float(ret[5][i])
                 csys = str(ret[3][i])
                 key = (pat, direction, value, csys)
                 if key not in seen:
@@ -351,7 +351,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
             loads.append({
                 "load_pattern": row_data[pat_col],
                 "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-                "value": -float(row_data[val_col]),
+                "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
 
@@ -422,7 +422,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
         loads.append({
             "load_pattern": row_data[pat_col],
             "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-            "value": -float(row_data[val_col]),
+            "value": float(row_data[val_col]),
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         })
 
@@ -490,7 +490,7 @@ def build_table_load_cache(etabs_model):
             cache.setdefault(name, []).append({
                 "load_pattern": pat,
                 "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-                "value": -float(row_data[val_col]),
+                "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
             table_count += 1
@@ -589,7 +589,7 @@ def build_table_load_cache(etabs_model):
         set_to_loads.setdefault(set_name, []).append({
             "load_pattern": pat,
             "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-            "value": -float(row_data[val_col]),
+            "value": float(row_data[val_col]),
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         })
 
@@ -767,7 +767,7 @@ def assign_load_to_safe(safe_model, slab_name, load):
     """
     try:
         ret = safe_model.AreaObj.SetLoadUniform(
-            slab_name, load["load_pattern"], load["value"],
+            slab_name, load["load_pattern"], -load["value"],
             load["direction"], True, load["csys"],
         )
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
@@ -808,7 +808,7 @@ def assign_load_to_safe(safe_model, slab_name, load):
         if dir_col is not None:
             new_row[dir_col] = str(load["direction"])
         if val_col is not None:
-            new_row[val_col] = str(load["value"])
+            new_row[val_col] = str(-load["value"])
         if csys_col is not None:
             new_row[csys_col] = load["csys"]
         table_data.extend(new_row)

@@ -890,7 +890,7 @@ def main():
         for load in loads:
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             print(f"  Load: Pattern='{load['load_pattern']}', "
-                  f"Dir={dir_name}, Value={load['value']:.4f}")
+                  f"Dir={dir_name}, Value={abs(load['value']):.4f}")
 
         # Match to SAFE slab using the ETABS label as the SAFE unique name
         safe_slab_name = label
@@ -928,10 +928,10 @@ def main():
             if ret == 0:
                 loads_assigned += 1
                 print(f"  Assigned: Pattern='{load['load_pattern']}', "
-                      f"Value={load['value']:.4f} -> OK")
+                      f"Value={abs(load['value']):.4f} -> OK")
             else:
                 print(f"  FAILED: Pattern='{load['load_pattern']}', "
-                      f"Value={load['value']:.4f} (ret={ret})")
+                      f"Value={abs(load['value']):.4f} (ret={ret})")
 
     # Refresh SAFE view
     safe_model.View.RefreshView(0, False)

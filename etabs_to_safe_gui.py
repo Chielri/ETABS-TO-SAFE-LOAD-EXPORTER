@@ -974,7 +974,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
         for load in loads:
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             logger.debug("  Load: Pattern='%s', Dir=%s, Value=%.4f, CSys='%s'",
-                         load["load_pattern"], dir_name, load["value"], load["csys"])
+                         load["load_pattern"], dir_name, abs(load["value"]), load["csys"])
 
         # Match: ETABS label -> SAFE unique name
         safe_slab_name = label
@@ -993,7 +993,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
                         "Level": story,
                         "LoadPattern": load["load_pattern"],
                         "Direction": dir_name,
-                        "Value": load["value"],
+                        "Value": abs(load["value"]),
                         "CSys": load["csys"],
                         "SAFE_SlabName": "",
                         "Assignment_Status": "Unmatched",
@@ -1025,11 +1025,11 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
             if ret == 0:
                 loads_assigned += 1
                 logger.info("  Assigned: Pattern='%s', Value=%.4f -> OK",
-                            load["load_pattern"], load["value"])
+                            load["load_pattern"], abs(load["value"]))
                 status = "OK"
             else:
                 logger.error("  FAILED: Pattern='%s', Value=%.4f (ret=%s)",
-                             load["load_pattern"], load["value"], ret)
+                             load["load_pattern"], abs(load["value"]), ret)
                 status = f"FAILED (ret={ret})"
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             csv_rows.append({
@@ -1038,7 +1038,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
                 "Level": story,
                 "LoadPattern": load["load_pattern"],
                 "Direction": dir_name,
-                "Value": load["value"],
+                "Value": abs(load["value"]),
                 "CSys": load["csys"],
                 "SAFE_SlabName": safe_slab_name,
                 "Assignment_Status": status,

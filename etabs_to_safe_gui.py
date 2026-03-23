@@ -210,7 +210,7 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                 loads.append({
                     "load_pattern": pat,
                     "direction": int(ret[4][i]),
-                    "value": -float(ret[5][i]),
+                    "value": float(ret[5][i]),
                     "csys": str(ret[3][i]),
                 })
             if loads:
@@ -236,7 +236,7 @@ def get_shell_uniform_loads(etabs_model, area_name, table_cache=None):
                 if pat.startswith("~"):
                     continue
                 direction = int(ret[4][i])
-                value = -float(ret[5][i])
+                value = float(ret[5][i])
                 csys = str(ret[3][i])
                 key = (pat, direction, value, csys)
                 if key not in seen:
@@ -390,7 +390,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
             load = {
                 "load_pattern": row_data[pat_col],
                 "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-                "value": -float(row_data[val_col]),
+                "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             }
             loads.append(load)
@@ -472,7 +472,7 @@ def _get_uniform_loads_from_tables(etabs_model, area_name):
         load = {
             "load_pattern": row_data[pat_col],
             "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-            "value": -float(row_data[val_col]),
+            "value": float(row_data[val_col]),
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         }
         loads.append(load)
@@ -551,7 +551,7 @@ def build_table_load_cache(etabs_model):
             cache.setdefault(name, []).append({
                 "load_pattern": pat,
                 "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-                "value": -float(row_data[val_col]),
+                "value": float(row_data[val_col]),
                 "csys": row_data[csys_col] if csys_col is not None else "Global",
             })
             table_count += 1
@@ -674,7 +674,7 @@ def build_table_load_cache(etabs_model):
         set_to_loads.setdefault(set_name, []).append({
             "load_pattern": pat,
             "direction": _parse_direction(row_data[dir_col]) if dir_col is not None else 6,
-            "value": -float(row_data[val_col]),
+            "value": float(row_data[val_col]),
             "csys": row_data[csys_col] if csys_col is not None else "Global",
         })
 
@@ -850,7 +850,7 @@ def assign_load_to_safe(safe_model, slab_name, load):
     """
     try:
         ret = safe_model.AreaObj.SetLoadUniform(
-            slab_name, load["load_pattern"], load["value"],
+            slab_name, load["load_pattern"], -load["value"],
             load["direction"], True, load["csys"],
         )
         retcode = ret[-1] if isinstance(ret, (tuple, list)) else ret
@@ -899,7 +899,7 @@ def _assign_load_via_tables(safe_model, slab_name, load):
         if dir_col is not None:
             new_row[dir_col] = str(load["direction"])
         if val_col is not None:
-            new_row[val_col] = str(load["value"])
+            new_row[val_col] = str(-load["value"])
         if csys_col is not None:
             new_row[csys_col] = load["csys"]
         table_data.extend(new_row)
@@ -974,7 +974,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
         for load in loads:
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             logger.debug("  Load: Pattern='%s', Dir=%s, Value=%.4f, CSys='%s'",
-                         load["load_pattern"], dir_name, abs(load["value"]), load["csys"])
+                         load["load_pattern"], dir_name, load["value"], load["csys"])
 
         # Match: ETABS label -> SAFE unique name
         safe_slab_name = label
@@ -993,7 +993,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
                         "Level": story,
                         "LoadPattern": load["load_pattern"],
                         "Direction": dir_name,
-                        "Value": abs(load["value"]),
+                        "Value": load["value"],
                         "CSys": load["csys"],
                         "SAFE_SlabName": "",
                         "Assignment_Status": "Unmatched",
@@ -1025,11 +1025,11 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
             if ret == 0:
                 loads_assigned += 1
                 logger.info("  Assigned: Pattern='%s', Value=%.4f -> OK",
-                            load["load_pattern"], abs(load["value"]))
+                            load["load_pattern"], load["value"])
                 status = "OK"
             else:
                 logger.error("  FAILED: Pattern='%s', Value=%.4f (ret=%s)",
-                             load["load_pattern"], abs(load["value"]), ret)
+                             load["load_pattern"], load["value"], ret)
                 status = f"FAILED (ret={ret})"
             dir_name = DIR_NAMES.get(load["direction"], f"Dir-{load['direction']}")
             csv_rows.append({
@@ -1038,7 +1038,7 @@ def run_export(progress_callback=None, etabs_pid=None, safe_pid=None):
                 "Level": story,
                 "LoadPattern": load["load_pattern"],
                 "Direction": dir_name,
-                "Value": abs(load["value"]),
+                "Value": load["value"],
                 "CSys": load["csys"],
                 "SAFE_SlabName": safe_slab_name,
                 "Assignment_Status": status,
